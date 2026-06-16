@@ -3,7 +3,7 @@ UPDATE THIS FILE when making architectural changes, adding patterns, or changing
 # Zeroshot: Multi-Agent Coordination Engine
 
 Operational rules and references for automated agents working on this repo. Install:
-`npm i -g @covibes/zeroshot` or `npm link` (dev).
+`npm i -g @the-open-engine/zeroshot` or `npm link` (dev).
 
 ## CRITICAL RULES
 
@@ -399,8 +399,8 @@ Workers are now explicitly ordered to treat every `VALIDATION_RESULT` line as no
 
 Multiple CI jobs fail → Diagnose each independently.
 
-1. Get exact status: `gh api repos/covibes/zeroshot/actions/runs/{RUN_ID}/jobs`
-2. Read ACTUAL error: `gh api repos/covibes/zeroshot/actions/jobs/{JOB_ID}/logs`
+1. Get exact status: `gh api repos/the-open-engine/zeroshot/actions/runs/{RUN_ID}/jobs`
+2. Read ACTUAL error: `gh api repos/the-open-engine/zeroshot/actions/jobs/{JOB_ID}/logs`
 3. Fix ONE error → Push → Rerun → Repeat
 
 ## Release Pipeline Convention

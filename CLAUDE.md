@@ -2,7 +2,7 @@ UPDATE THIS FILE when making architectural changes, adding patterns, or changing
 
 # Zeroshot: Multi-Agent Coordination Engine
 
-Message-passing primitives for multi-agent workflows. **Install:** `npm i -g @covibes/zeroshot` or `npm link` (dev).
+Message-passing primitives for multi-agent workflows. **Install:** `npm i -g @the-open-engine/zeroshot` or `npm link` (dev).
 
 ## 🔴 CRITICAL RULES
 
@@ -520,7 +520,7 @@ npm run typecheck         # TypeScript (if applicable)
 1. **Get exact status:**
 
    ```bash
-   gh api repos/covibes/zeroshot/actions/runs/{RUN_ID}/jobs \
+   gh api repos/the-open-engine/zeroshot/actions/runs/{RUN_ID}/jobs \
      --jq '.jobs[] | "\(.name): \(.status) (\(.conclusion // "pending"))"'
    ```
 
@@ -528,7 +528,7 @@ npm run typecheck         # TypeScript (if applicable)
 
    ```bash
    # ✅ CORRECT - Uses API, works for completed jobs
-   gh api repos/covibes/zeroshot/actions/jobs/{JOB_ID}/logs 2>&1 | grep -E "FAIL|Error"
+   gh api repos/the-open-engine/zeroshot/actions/jobs/{JOB_ID}/logs 2>&1 | grep -E "FAIL|Error"
 
    # ❌ WRONG - Waits for ENTIRE run to complete
    gh run view {RUN_ID} --log
