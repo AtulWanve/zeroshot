@@ -20,6 +20,7 @@ const { normalizeProviderName } = require('../lib/provider-names');
 const { resolveMounts, resolveEnvs, expandEnvPatterns } = require('../lib/docker-config');
 const { getProvider } = require('./providers');
 const { readRepoSettings } = require('../lib/repo-settings');
+const { provisionClaudeCredentials } = require('./claude-credentials');
 
 const DEFAULT_WORKTREE_SETUP_TIMEOUT_MS = 15 * 60 * 1000;
 
@@ -1036,14 +1037,12 @@ class IsolationManager {
     const projectsDir = path.join(configDir, 'projects');
     fs.mkdirSync(projectsDir, { recursive: true });
 
-    // Copy only credentials file (essential for auth)
-    const credentialsFile = path.join(sourceDir, '.credentials.json');
-    if (fs.existsSync(credentialsFile)) {
-      fs.copyFileSync(credentialsFile, path.join(configDir, '.credentials.json'));
-    }
+    // Copy credentials file, or materialize from macOS Keychain if none exists
+    // (essential for auth; see src/claude-credentials.js)
+    provisionClaudeCredentials({ sourceDir, destDir: configDir });
 
     // Copy hook script to block AskUserQuestion (CRITICAL for autonomous execution)
-    const hookScriptSrc = path.join(__dirname, '..', 'hooks', 'block-ask-user-question.py');
+    const hookScriptSrc = path.join(__dirname, '..', 'cluster-hooks', 'block-ask-user-question.py');
     const hookScriptDst = path.join(hooksDir, 'block-ask-user-question.py');
     if (fs.existsSync(hookScriptSrc)) {
       fs.copyFileSync(hookScriptSrc, hookScriptDst);
@@ -1651,10 +1650,14 @@ class IsolationManager {
     // Tear down any Docker Compose services that may have been started in this worktree.
     // Without this, containers keep running with host port mappings after the worktree is deleted,
     // blocking port allocation for the main project or other worktrees.
-    const composePath = path.join(worktreeInfo.path, 'docker-compose.yml');
-    if (fs.existsSync(composePath)) {
+    // NEVER pass --volumes (irreversible data loss) and NEVER tear down a pinned/shared
+    // Compose project — only a project scoped to the worktree directory basename, which is
+    // the only kind zeroshot could itself have created, is touched.
+    const { resolveWorktreeComposeTeardown } = require('../lib/compose-utils');
+    const teardown = resolveWorktreeComposeTeardown(worktreeInfo.path);
+    if (teardown.shouldTeardown) {
       try {
-        runSync('docker', ['compose', 'down', '--remove-orphans', '--volumes', '--timeout', '10'], {
+        runSync('docker', teardown.args, {
           cwd: worktreeInfo.path,
           encoding: 'utf8',
           stdio: 'pipe',

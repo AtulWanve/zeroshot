@@ -1,6 +1,6 @@
 const assert = require('assert');
 
-const { loadClusterConfig } = require('../../lib/start-cluster');
+const { loadClusterConfig, buildStartOptions } = require('../../lib/start-cluster');
 
 function createOrchestrator(config) {
   const calls = { loadConfig: [] };
@@ -45,5 +45,46 @@ describe('start-cluster config loading', function () {
     assert.strictEqual(config.agents[0].modelLevel, 'level3');
     assert.strictEqual(config.agents[0].timeout, '0');
     assert.strictEqual(config.agents[0].prompt.system, 'Plan a TASK');
+  });
+});
+
+describe('buildStartOptions() runMode', function () {
+  it('derives runMode "ship" from pre-transform mergedOptions', function () {
+    const result = buildStartOptions({ clusterId: 'c1', options: { ship: true } });
+    assert.strictEqual(result.runMode, 'ship');
+  });
+
+  it('derives runMode "pr+docker" even though transformed output has no .pr/.docker keys', function () {
+    const result = buildStartOptions({ clusterId: 'c1', options: { pr: true, docker: true } });
+    assert.strictEqual(result.runMode, 'pr+docker');
+    assert.strictEqual(result.pr, undefined);
+    assert.strictEqual(result.docker, undefined);
+  });
+
+  it('returns null runMode when no isolation flags are set', function () {
+    const result = buildStartOptions({ clusterId: 'c1', options: {} });
+    assert.strictEqual(result.runMode, null);
+  });
+});
+
+describe('buildStartOptions() autoMerge', function () {
+  it('resolves autoMerge=true for --ship', function () {
+    const result = buildStartOptions({ clusterId: 'c1', options: { ship: true } });
+    assert.strictEqual(result.autoMerge, true);
+  });
+
+  it('resolves autoMerge=false for --pr', function () {
+    const result = buildStartOptions({ clusterId: 'c1', options: { pr: true } });
+    assert.strictEqual(result.autoMerge, false);
+  });
+
+  it('ignores the dead ZEROSHOT_MERGE env var (removed signal has no effect)', function () {
+    process.env.ZEROSHOT_MERGE = '1';
+    try {
+      const result = buildStartOptions({ clusterId: 'c1', options: { pr: true } });
+      assert.strictEqual(result.autoMerge, false);
+    } finally {
+      delete process.env.ZEROSHOT_MERGE;
+    }
   });
 });

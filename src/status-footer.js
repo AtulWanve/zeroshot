@@ -118,6 +118,7 @@ class StatusFooter {
     this.scrollRegionSet = false;
     this.clusterId = null;
     this.clusterState = 'initializing';
+    this.runMode = null;
     this.startTime = Date.now();
     this.messageBus = null; // MessageBus for token usage tracking
 
@@ -390,6 +391,14 @@ class StatusFooter {
    */
   setClusterState(state) {
     this.clusterState = state;
+  }
+
+  /**
+   * Set the armed run mode (e.g. 'ship', 'pr', 'worktree', 'docker')
+   * @param {string|null} mode
+   */
+  setRunMode(mode) {
+    this.runMode = mode;
   }
 
   /**
@@ -677,6 +686,10 @@ class StatusFooter {
       content += ` ${COLORS.cyan}${COLORS.bold}${shortId}${COLORS.reset} `;
     }
 
+    if (this.runMode) {
+      content += `${COLORS.dim}[${this.runMode}]${COLORS.reset} `;
+    }
+
     // Fill with border
     const contentLen = this.stripAnsi(content).length;
     const padding = Math.max(0, width - contentLen - 1);
@@ -879,7 +892,6 @@ class StatusFooter {
    * @returns {string}
    */
   stripAnsi(str) {
-    // eslint-disable-next-line no-control-regex
     return str.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
   }
 

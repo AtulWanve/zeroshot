@@ -12,7 +12,7 @@ const tsconfigRootDir = dirname(fileURLToPath(import.meta.url));
 export default [
   {
     linterOptions: {
-      noInlineConfig: true, // Disallow eslint-disable - FIX CODE, don't disable rules
+      reportUnusedDisableDirectives: 'error', // Fail on eslint-disable that suppresses nothing
     },
   },
   js.configs.recommended,
@@ -42,6 +42,8 @@ export default [
         clearInterval: 'readonly',
         setImmediate: 'readonly',
         clearImmediate: 'readonly',
+        fetch: 'readonly',
+        AbortController: 'readonly',
       },
     },
     rules: {

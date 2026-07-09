@@ -5,7 +5,6 @@
  * Part of issue #340 - Prevent git-pusher hallucination
  */
 
-/* global describe, beforeEach, afterEach, it */
 const assert = require('assert');
 const childProcess = require('child_process');
 
@@ -570,5 +569,157 @@ describe('verify_pull_request hook action', () => {
     assert.strictEqual(agent.lastPublished.content.data.pr_number, 42);
     assert.strictEqual(agent.lastPublished.content.data.mr_number, 42);
     assert.strictEqual(agent.lastPublished.content.data.verification_platform, 'gitlab');
+  });
+
+  // REGRESSION: issue #452 - `--pr` (autoMerge=false) must stop at PR creation.
+  // An OPEN, unmerged PR is the SUCCESS case for --pr mode, not a failure.
+  describe('review mode (autoMerge=false, --pr without --ship)', () => {
+    it('publishes CLUSTER_COMPLETE for an OPEN unmerged PR without polling or failing', async function () {
+      const agent = createMockAgent();
+      const hook = { action: 'verify_pull_request', config: { autoMerge: false } };
+      const result = {
+        output: JSON.stringify({
+          pr_url: 'https://github.com/org/repo/pull/123',
+          pr_number: 123,
+          merged: false,
+        }),
+      };
+
+      let callCount = 0;
+      mockSpawnSyncFn = () => {
+        callCount++;
+        return spawnSuccess(
+          JSON.stringify({
+            number: 123,
+            state: 'OPEN',
+            mergedAt: null,
+            url: 'https://github.com/org/repo/pull/123',
+          })
+        );
+      };
+
+      await executeHook({ hook, agent, result });
+
+      assert(agent.lastPublished, 'Expected CLUSTER_COMPLETE to be published');
+      assert.strictEqual(agent.lastPublished.topic, 'CLUSTER_COMPLETE');
+      assert.strictEqual(agent.lastPublished.content.data.reason, 'git-pusher-complete-verified');
+      assert.strictEqual(agent.lastPublished.content.data.pr_number, 123);
+      assert.strictEqual(agent.lastPublished.content.data.merged, false);
+      assert.strictEqual(
+        agent.lastPublished.content.data.verification_pending,
+        undefined,
+        'review mode is a final success, not a pending state'
+      );
+      // Only the initial fetch should run - no merge-polling loop for autoMerge=false.
+      assert.strictEqual(callCount, 1, `Expected exactly 1 gh call (got ${callCount})`);
+    });
+
+    it('treats PR existence as success even if review-mode agent output claims merged:true', async function () {
+      const agent = createMockAgent();
+      const hook = { action: 'verify_pull_request', config: { autoMerge: false } };
+      const result = {
+        output: JSON.stringify({
+          pr_url: 'https://github.com/org/repo/pull/124',
+          pr_number: 124,
+          merged: true,
+        }),
+      };
+
+      let callCount = 0;
+      mockSpawnSyncFn = () => {
+        callCount++;
+        return spawnSuccess(
+          JSON.stringify({
+            number: 124,
+            state: 'OPEN',
+            mergedAt: null,
+            url: 'https://github.com/org/repo/pull/124',
+          })
+        );
+      };
+
+      await executeHook({ hook, agent, result });
+
+      assert.strictEqual(agent.lastPublished.topic, 'CLUSTER_COMPLETE');
+      assert.strictEqual(agent.lastPublished.content.data.reason, 'git-pusher-complete-verified');
+      assert.strictEqual(agent.lastPublished.content.data.pr_number, 124);
+      assert.strictEqual(agent.lastPublished.content.data.merged, false);
+      assert.strictEqual(callCount, 1, `Expected exactly 1 gh call (got ${callCount})`);
+    });
+
+    it('fails review mode when GitHub reports the PR is already merged', async function () {
+      const agent = createMockAgent();
+      const hook = { action: 'verify_pull_request', config: { autoMerge: false } };
+      const result = {
+        output: JSON.stringify({
+          pr_url: 'https://github.com/org/repo/pull/125',
+          pr_number: 125,
+          merged: false,
+        }),
+      };
+
+      mockSpawnSyncFn = () =>
+        spawnSuccess(
+          JSON.stringify({
+            number: 125,
+            state: 'MERGED',
+            mergedAt: '2026-07-08T20:00:00Z',
+            url: 'https://github.com/org/repo/pull/125',
+          })
+        );
+
+      await assert.rejects(
+        () => executeHook({ hook, agent, result }),
+        /already merged.*review mode \(autoMerge=false\)/i
+      );
+      assert.strictEqual(agent.lastPublished, null, 'merged review-mode PR must not complete');
+    });
+
+    it('still throws when the PR does not exist (hallucination check still applies)', async function () {
+      const agent = createMockAgent();
+      const hook = { action: 'verify_pull_request', config: { autoMerge: false } };
+      const result = {
+        output: JSON.stringify({
+          pr_url: 'https://github.com/org/repo/pull/9999',
+          merged: false,
+        }),
+      };
+
+      mockSpawnSyncFn = () => spawnFailure('Could not resolve to a PullRequest');
+
+      await assert.rejects(() => executeHook({ hook, agent, result }), /DOES NOT EXIST/);
+    });
+
+    it('undefined autoMerge (existing callers) still defaults to merge-required (fail-closed)', async function () {
+      const agent = createMockAgent();
+      const hook = { action: 'verify_pull_request' }; // no config at all
+      const result = {
+        output: JSON.stringify({
+          pr_url: 'https://github.com/org/repo/pull/123',
+          pr_number: 123,
+          merged: true,
+        }),
+      };
+
+      // Always OPEN -> should hit the existing verification-pending path, not the
+      // review-mode short-circuit, proving the undefined -> true default held.
+      mockSpawnSyncFn = () => {
+        return spawnSuccess(
+          JSON.stringify({
+            number: 123,
+            state: 'OPEN',
+            mergedAt: null,
+            url: 'https://github.com/org/repo/pull/123',
+          })
+        );
+      };
+
+      await executeHook({ hook, agent, result });
+      assert.strictEqual(
+        agent.lastPublished.content.data.reason,
+        'git-pusher-complete-verification-pending'
+      );
+      assert.strictEqual(agent.lastPublished.content.data.verification_pending, true);
+    });
   });
 });

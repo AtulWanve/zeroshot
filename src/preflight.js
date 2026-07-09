@@ -21,6 +21,7 @@ const {
 const { loadSettings, getClaudeCommand } = require('../lib/settings.js');
 const { normalizeProviderName } = require('../lib/provider-names');
 const { detectGitContext } = require('../lib/git-remote-utils');
+const { readKeychainCredentials } = require('./claude-credentials');
 
 /**
  * Validation result
@@ -133,17 +134,12 @@ function checkMacOsKeychain() {
     return { authenticated: false, error: 'Not macOS' };
   }
 
-  try {
-    // Check if Claude Code credentials exist in Keychain
-    execSync('security find-generic-password -s "Claude Code-credentials"', {
-      encoding: 'utf8',
-      stdio: 'pipe',
-      timeout: 2000,
-    });
+  // Reuses the same Keychain read that provisions isolated agent configs, so a
+  // green preflight here genuinely predicts runtime auth availability.
+  if (readKeychainCredentials()) {
     return { authenticated: true, error: null };
-  } catch {
-    return { authenticated: false, error: 'No credentials in Keychain' };
   }
+  return { authenticated: false, error: 'No credentials in Keychain' };
 }
 
 /**
@@ -523,7 +519,7 @@ function validateGitRequirement() {
  * @param {string} options.provider - Provider override
  * @returns {ValidationResult}
  */
-function runPreflight(options = {}) {
+async function runPreflight(options = {}) {
   const errors = [];
   const warnings = [];
 
@@ -562,8 +558,8 @@ function runPreflight(options = {}) {
     if (ProviderClass) {
       const tool = ProviderClass.getRequiredTool();
 
-      // Check if tool is installed
-      if (!commandExists(tool.name)) {
+      // Check if tool is installed (providers with no CLI binary set tool.name to null)
+      if (tool.name && !commandExists(tool.name)) {
         errors.push(
           formatError(
             `${ProviderClass.displayName} CLI (${tool.name}) not installed`,
@@ -577,7 +573,7 @@ function runPreflight(options = {}) {
         // This ensures we check auth for the actual target, not the current repo
         const targetHost =
           options.targetHost || detectGitContext(options.cwd || process.cwd())?.host;
-        const authResult = ProviderClass.checkAuth(targetHost);
+        const authResult = await ProviderClass.checkAuth(targetHost);
         if (!authResult.authenticated) {
           errors.push(
             formatError(
@@ -628,7 +624,7 @@ function runPreflight(options = {}) {
       } else if (tool && ProviderClass) {
         // Check provider authentication (abstracted per provider)
         // Pass hostname for multi-instance providers (e.g., GitLab with self-hosted)
-        const authResult = ProviderClass.checkAuth(prGitContext?.host);
+        const authResult = await ProviderClass.checkAuth(prGitContext?.host);
         if (!authResult.authenticated) {
           errors.push(
             formatError(
@@ -673,8 +669,8 @@ function runPreflight(options = {}) {
  * @param {boolean} options.quiet - Suppress success messages
  * @param {string} options.provider - Provider override
  */
-function requirePreflight(options = {}) {
-  const result = runPreflight(options);
+async function requirePreflight(options = {}) {
+  const result = await runPreflight(options);
 
   // Print warnings regardless of success
   if (result.warnings.length > 0) {

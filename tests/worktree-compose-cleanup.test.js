@@ -1,18 +1,17 @@
 /**
  * Worktree Docker Compose Cleanup Test Suite
  *
- * Regression test for bug where `docker compose down` was never called when
- * cleaning up zeroshot worktrees. Agents could run `docker compose up` inside
- * worktrees, and those containers would keep running after session end,
- * hogging host ports (5433, 6379, 3001, etc.) and blocking the main project.
+ * Regression tests for worktree Docker Compose cleanup.
  *
- * Root cause: removeWorktree() only did `git worktree remove` + `fs.rmSync`,
- * never tore down Docker Compose services. The orchestrator stop() path
- * (Ctrl+C / SIGINT) preserved worktrees entirely, including running containers.
+ * Safety contract:
+ * - automatic cleanup must never pass `--volumes`
+ * - automatic cleanup must never touch a pinned/shared Compose project
+ * - automatic cleanup may only tear down a project explicitly scoped to the
+ *   worktree directory basename
  *
- * Fix:
- * - isolation-manager.js: removeWorktree() now calls `docker compose down` first
- * - orchestrator.js: stop() calls _teardownWorktreeCompose() even when preserving worktree
+ * These tests cover both cleanup entry points:
+ * - IsolationManager.removeWorktree() for completed --pr/--ship cleanup
+ * - Orchestrator._teardownWorktreeCompose() for stop/Ctrl+C cleanup
  */
 
 const assert = require('assert');
@@ -26,7 +25,7 @@ function isComposeDownCall(call) {
     call.command === 'docker' &&
     Array.isArray(call.args) &&
     call.args[0] === 'compose' &&
-    call.args[1] === 'down'
+    call.args.includes('down')
   );
 }
 
@@ -34,13 +33,23 @@ describe('Worktree Docker Compose Cleanup', function () {
   this.timeout(10000);
 
   let tmpDir;
+  let origComposeProjectName;
 
   beforeEach(function () {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zeroshot-compose-cleanup-'));
+    // Isolate from any host-level COMPOSE_PROJECT_NAME (e.g. this repo's own dev setup
+    // may export one) so unpinned-project tests reflect the worktree-basename default.
+    origComposeProjectName = process.env.COMPOSE_PROJECT_NAME;
+    delete process.env.COMPOSE_PROJECT_NAME;
   });
 
   afterEach(function () {
     fs.rmSync(tmpDir, { recursive: true, force: true });
+    if (origComposeProjectName === undefined) {
+      delete process.env.COMPOSE_PROJECT_NAME;
+    } else {
+      process.env.COMPOSE_PROJECT_NAME = origComposeProjectName;
+    }
   });
 
   describe('IsolationManager.removeWorktree', function () {
@@ -89,8 +98,13 @@ describe('Worktree Docker Compose Cleanup', function () {
           'docker compose down should use --remove-orphans'
         );
         assert.ok(
-          composeDownCall.args.includes('--volumes'),
-          'docker compose down should use --volumes to free disk'
+          !composeDownCall.args.includes('--volumes'),
+          'docker compose down must NEVER use --volumes (irreversible data loss on shared projects)'
+        );
+        assert.ok(
+          composeDownCall.args.includes('-p') &&
+            composeDownCall.args[composeDownCall.args.indexOf('-p') + 1] === 'test-worktree',
+          'docker compose down should pin the project to the worktree directory basename'
         );
 
         // Verify ordering: compose down appears before git worktree remove
@@ -148,6 +162,102 @@ describe('Worktree Docker Compose Cleanup', function () {
           'docker compose should NOT be called when no docker-compose.yml exists'
         );
       } finally {
+        childProcess.spawnSync = origSpawnSync;
+        delete require.cache[require.resolve('../src/isolation-manager')];
+      }
+    });
+
+    it('should skip docker compose down when compose project name is pinned via top-level name', function () {
+      const origSpawnSync = childProcess.spawnSync;
+      const calls = [];
+
+      childProcess.spawnSync = function (command, args, opts) {
+        calls.push({ command, args, cwd: opts?.cwd });
+        if (command === 'git' && args[0] === 'worktree') {
+          return { status: 1, stdout: '', stderr: 'not a git repo' };
+        }
+        return { status: 0, stdout: '', stderr: '' };
+      };
+
+      try {
+        delete require.cache[require.resolve('../src/isolation-manager')];
+        const IsolationManager = require('../src/isolation-manager');
+        const manager = new IsolationManager();
+
+        const fakeWorktreePath = path.join(tmpDir, 'pinned-name-worktree');
+        fs.mkdirSync(fakeWorktreePath, { recursive: true });
+        fs.writeFileSync(
+          path.join(fakeWorktreePath, 'docker-compose.yml'),
+          'name: myproj\nservices:\n  db:\n    image: postgres\n'
+        );
+
+        manager.worktrees.set('test-pinned-name', {
+          path: fakeWorktreePath,
+          branch: 'zeroshot/test-pinned-name',
+          repoRoot: tmpDir,
+        });
+
+        manager.cleanupWorktreeIsolation('test-pinned-name');
+
+        const composeCall = calls.find(
+          (c) => c.command === 'docker' && Array.isArray(c.args) && c.args[0] === 'compose'
+        );
+        assert.strictEqual(
+          composeCall,
+          undefined,
+          'docker compose down must NOT be invoked when the project name is pinned'
+        );
+      } finally {
+        childProcess.spawnSync = origSpawnSync;
+        delete require.cache[require.resolve('../src/isolation-manager')];
+      }
+    });
+
+    it('should skip docker compose down when COMPOSE_PROJECT_NAME env var is set', function () {
+      const origSpawnSync = childProcess.spawnSync;
+      const origEnv = process.env.COMPOSE_PROJECT_NAME;
+      const calls = [];
+
+      childProcess.spawnSync = function (command, args, opts) {
+        calls.push({ command, args, cwd: opts?.cwd });
+        if (command === 'git' && args[0] === 'worktree') {
+          return { status: 1, stdout: '', stderr: 'not a git repo' };
+        }
+        return { status: 0, stdout: '', stderr: '' };
+      };
+
+      process.env.COMPOSE_PROJECT_NAME = 'shared-host-project';
+      try {
+        delete require.cache[require.resolve('../src/isolation-manager')];
+        const IsolationManager = require('../src/isolation-manager');
+        const manager = new IsolationManager();
+
+        const fakeWorktreePath = path.join(tmpDir, 'pinned-env-worktree');
+        fs.mkdirSync(fakeWorktreePath, { recursive: true });
+        fs.writeFileSync(path.join(fakeWorktreePath, 'docker-compose.yml'), 'version: "3"');
+
+        manager.worktrees.set('test-pinned-env', {
+          path: fakeWorktreePath,
+          branch: 'zeroshot/test-pinned-env',
+          repoRoot: tmpDir,
+        });
+
+        manager.cleanupWorktreeIsolation('test-pinned-env');
+
+        const composeCall = calls.find(
+          (c) => c.command === 'docker' && Array.isArray(c.args) && c.args[0] === 'compose'
+        );
+        assert.strictEqual(
+          composeCall,
+          undefined,
+          'docker compose down must NOT be invoked when COMPOSE_PROJECT_NAME pins a shared project'
+        );
+      } finally {
+        if (origEnv === undefined) {
+          delete process.env.COMPOSE_PROJECT_NAME;
+        } else {
+          process.env.COMPOSE_PROJECT_NAME = origEnv;
+        }
         childProcess.spawnSync = origSpawnSync;
         delete require.cache[require.resolve('../src/isolation-manager')];
       }
@@ -223,7 +333,72 @@ describe('Worktree Docker Compose Cleanup', function () {
       assert.ok(composeCall, '_teardownWorktreeCompose should call docker compose down');
       assert.strictEqual(composeCall.cwd, fakeWorktreePath);
       assert.ok(composeCall.args.includes('--remove-orphans'));
-      assert.ok(composeCall.args.includes('--volumes'));
+      assert.ok(
+        !composeCall.args.includes('--volumes'),
+        'docker compose down must NEVER use --volumes (irreversible data loss on shared projects)'
+      );
+      assert.ok(
+        composeCall.args.includes('-p') &&
+          composeCall.args[composeCall.args.indexOf('-p') + 1] === 'stop-test-worktree',
+        'docker compose down should pin the project to the worktree directory basename'
+      );
+    });
+
+    it('should skip docker compose down when compose project name is pinned via top-level name', function () {
+      const Orchestrator = require('../src/orchestrator');
+      const orchestrator = new Orchestrator({ dataDir: tmpDir });
+
+      const fakeWorktreePath = path.join(tmpDir, 'pinned-name-worktree');
+      fs.mkdirSync(fakeWorktreePath, { recursive: true });
+      fs.writeFileSync(
+        path.join(fakeWorktreePath, 'docker-compose.yml'),
+        'name: myproj\nservices:\n  db:\n    image: postgres\n'
+      );
+
+      const calls = [];
+      childProcess.spawnSync = function (command, args, opts) {
+        calls.push({ command, args, cwd: opts?.cwd });
+        return { status: 0, stdout: '', stderr: '' };
+      };
+
+      orchestrator._teardownWorktreeCompose(fakeWorktreePath);
+      assert.strictEqual(
+        calls.length,
+        0,
+        'docker compose down must NOT be invoked when the project name is pinned (shared host project)'
+      );
+    });
+
+    it('should skip docker compose down when COMPOSE_PROJECT_NAME env var is set', function () {
+      const Orchestrator = require('../src/orchestrator');
+      const orchestrator = new Orchestrator({ dataDir: tmpDir });
+
+      const fakeWorktreePath = path.join(tmpDir, 'pinned-env-worktree');
+      fs.mkdirSync(fakeWorktreePath, { recursive: true });
+      fs.writeFileSync(path.join(fakeWorktreePath, 'docker-compose.yml'), 'version: "3"');
+
+      const calls = [];
+      childProcess.spawnSync = function (command, args, opts) {
+        calls.push({ command, args, cwd: opts?.cwd });
+        return { status: 0, stdout: '', stderr: '' };
+      };
+
+      const origEnv = process.env.COMPOSE_PROJECT_NAME;
+      process.env.COMPOSE_PROJECT_NAME = 'shared-host-project';
+      try {
+        orchestrator._teardownWorktreeCompose(fakeWorktreePath);
+        assert.strictEqual(
+          calls.length,
+          0,
+          'docker compose down must NOT be invoked when COMPOSE_PROJECT_NAME pins a shared project'
+        );
+      } finally {
+        if (origEnv === undefined) {
+          delete process.env.COMPOSE_PROJECT_NAME;
+        } else {
+          process.env.COMPOSE_PROJECT_NAME = origEnv;
+        }
+      }
     });
 
     it('should skip when no docker-compose.yml exists', function () {

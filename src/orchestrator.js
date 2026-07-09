@@ -33,6 +33,7 @@ function cleanStaleLock(lockPath) {
     // Ignore - another process may have cleaned it
   }
 }
+const { readClustersFileSync, writeClustersFileAtomic } = require('../lib/clusters-registry');
 const AgentWrapper = require('./agent-wrapper');
 const SubClusterWrapper = require('./sub-cluster-wrapper');
 const MessageBus = require('./message-bus');
@@ -55,6 +56,24 @@ const {
   resolveClusterCommandProofs,
 } = require('./command-proofs');
 const crypto = require('crypto');
+
+/**
+ * Thrown when a run is rejected because the issue already has an active cluster.
+ * This is expected control flow (a benign guard), not a crash - callers should
+ * check `error.code === 'DUPLICATE_CLUSTER'` and present it without a stack trace.
+ */
+class DuplicateClusterError extends Error {
+  constructor(message, { issueNumber, existingClusterId, existingState, existingPid, ageMinutes }) {
+    super(message);
+    this.name = 'DuplicateClusterError';
+    this.code = 'DUPLICATE_CLUSTER';
+    this.issueNumber = issueNumber;
+    this.existingClusterId = existingClusterId;
+    this.existingState = existingState;
+    this.existingPid = existingPid;
+    this.ageMinutes = ageMinutes;
+  }
+}
 
 function applyModelOverride(agentConfig, modelOverride) {
   if (!modelOverride) return;
@@ -193,20 +212,20 @@ function applyPushBlockedRepairTriggers(config) {
   }
 }
 
+function resolveAutoMerge(options) {
+  return Boolean(options.ship) || Boolean(options.autoMerge);
+}
+
 function buildPrOptions(options, requiredQualityGates) {
-  if (
-    !options.prBase &&
-    !options.mergeQueue &&
-    !options.closeIssue &&
-    requiredQualityGates.length === 0
-  ) {
-    return null;
-  }
+  // autoMerge must always be persisted (even when no other PR fields are set) so that
+  // `zeroshot run --pr` (autoMerge=false) vs `--ship` (autoMerge=true) survives resume.
+  const autoMerge = resolveAutoMerge(options);
 
   return {
     prBase: options.prBase || null,
     mergeQueue: options.mergeQueue || false,
     closeIssue: options.closeIssue || null,
+    autoMerge,
     ...(requiredQualityGates.length > 0 ? { requiredQualityGates } : {}),
     cwd: options.cwd || process.cwd(),
   };
@@ -216,6 +235,11 @@ class Orchestrator {
   constructor(options = {}) {
     this.clusters = new Map(); // cluster_id -> cluster object
     this.quiet = options.quiet || false; // Suppress verbose logging
+    // Read-only mode: opens ledgers without write access and skips schema DDL/
+    // side-effecting bootstrap (state snapshotter). Used by CLI read commands
+    // (list/status/logs) so they can never contend with a live daemon's writer
+    // connection or mutate shared state as a side effect of a plain read.
+    this.readonly = options.readonly === true;
 
     // TaskRunner DI - allows injecting MockTaskRunner for testing
     // When set, passed to all AgentWrappers to control task execution
@@ -336,14 +360,12 @@ class Orchestrator {
         },
       });
 
-      const data = JSON.parse(fs.readFileSync(clustersFile, 'utf8'));
+      const data = readClustersFileSync(this.storageDir);
       const clusterIds = Object.keys(data);
       this._log(`[Orchestrator] Found ${clusterIds.length} clusters in file:`, clusterIds);
 
-      // Track clusters to remove (missing .db files or 0 messages)
+      // Track clusters to remove (missing .db files)
       const clustersToRemove = [];
-      // Track clusters with 0 messages (corrupted from SIGINT race condition)
-      const corruptedClusters = [];
 
       for (const [clusterId, clusterData] of Object.entries(data)) {
         if (clusterData?.state === 'setup' || clusterData?.provisional === true) {
@@ -362,56 +384,27 @@ class Orchestrator {
         }
 
         this._log(`[Orchestrator] Loading cluster: ${clusterId}`);
-        let cluster;
         try {
-          cluster = this._loadSingleCluster(clusterId, clusterData);
+          this._loadSingleCluster(clusterId, clusterData);
         } catch (error) {
           console.warn(
             `[Orchestrator] Skipping cluster ${clusterId}: ${error.message || String(error)}`
           );
           continue;
         }
-
-        // VALIDATION: Detect 0-message clusters (corrupted from SIGINT during initialization)
-        // These clusters were created before the initCompletePromise fix was applied
-        if (cluster && cluster.messageBus) {
-          const messageCount = cluster.messageBus.count({ cluster_id: clusterId });
-          if (messageCount === 0) {
-            console.warn(`[Orchestrator] ⚠️  Cluster ${clusterId} has 0 messages (corrupted)`);
-            console.warn(
-              `[Orchestrator]    This likely occurred from SIGINT during initialization.`
-            );
-            console.warn(
-              `[Orchestrator]    Marking as 'corrupted' - use 'zeroshot kill ${clusterId}' to remove.`
-            );
-            corruptedClusters.push(clusterId);
-            // Mark cluster as corrupted for visibility in status/list commands
-            cluster.state = 'corrupted';
-            cluster.corruptedReason = 'SIGINT during initialization (0 messages in ledger)';
-          }
-        }
       }
 
-      // Clean up orphaned entries from clusters.json
-      if (clustersToRemove.length > 0) {
+      // Clean up orphaned entries from clusters.json. This is a write side effect,
+      // so it must never run for read-only (list/status/logs) instances - only the
+      // writable orchestrator that owns the registry performs cleanup.
+      if (!this.readonly && clustersToRemove.length > 0) {
         for (const clusterId of clustersToRemove) {
           delete data[clusterId];
         }
-        fs.writeFileSync(clustersFile, JSON.stringify(data, null, 2));
+        writeClustersFileAtomic(this.storageDir, data);
         this._log(
           `[Orchestrator] Removed ${clustersToRemove.length} orphaned cluster(s) from registry`
         );
-      }
-
-      // Log summary of corrupted clusters
-      if (corruptedClusters.length > 0) {
-        console.warn(
-          `\n[Orchestrator] ⚠️  Found ${corruptedClusters.length} corrupted cluster(s):`
-        );
-        for (const clusterId of corruptedClusters) {
-          console.warn(`    - ${clusterId}`);
-        }
-        console.warn(`[Orchestrator] Run 'zeroshot clear' to remove all corrupted clusters.\n`);
       }
 
       this._log(`[Orchestrator] Total clusters loaded: ${this.clusters.size}`);
@@ -462,6 +455,10 @@ class Orchestrator {
       getTokensByRole: () => ({
         _total: { count: 0, inputTokens: 0, outputTokens: 0, totalCostUsd: 0 },
       }),
+      readSnapshot: () => ({
+        messageCount: 0,
+        tokensByRole: { _total: { count: 0, inputTokens: 0, outputTokens: 0, totalCostUsd: 0 } },
+      }),
       pollForMessages: () => noop,
       on: noop,
       off: noop,
@@ -488,6 +485,7 @@ class Orchestrator {
       since: (params) => ledger.since(params),
       getAll: (clusterId) => ledger.getAll(clusterId),
       getTokensByRole: (clusterId) => ledger.getTokensByRole(clusterId),
+      readSnapshot: (clusterId) => ledger.readSnapshot(clusterId),
       addWebSocketClient: noop,
       removeWebSocketClient: noop,
       on: noop,
@@ -527,9 +525,11 @@ class Orchestrator {
       return this.clusters.get(clusterId);
     }
 
-    // Restore ledger and message bus
+    // Restore ledger and message bus. Read-only orchestrators (CLI list/status/logs)
+    // open the ledger without write access so they can never contend with the live
+    // daemon's writer connection or take a write lock on another process's database.
     const dbPath = path.join(this.storageDir, `${clusterId}.db`);
-    const ledger = new Ledger(dbPath);
+    const ledger = new Ledger(dbPath, { readonly: this.readonly });
     const messageBus = new MessageBus(ledger);
 
     // Restore isolation manager FIRST if cluster was running in isolation mode
@@ -573,7 +573,12 @@ class Orchestrator {
     Object.assign(clusterContext, cluster);
 
     this.clusters.set(clusterId, clusterContext);
-    this._startSnapshotter(clusterContext);
+    // The snapshotter bootstraps by publishing a STATE_SNAPSHOT message if one is
+    // missing - a ledger write. Read-only orchestrators must never write, so they
+    // skip it; they only need to read existing snapshots, not produce new ones.
+    if (!this.readonly) {
+      this._startSnapshotter(clusterContext);
+    }
     this._log(`[Orchestrator] Loaded cluster: ${clusterId} with ${agents.length} agents`);
 
     return clusterContext;
@@ -720,7 +725,7 @@ class Orchestrator {
 
     const clustersFile = path.join(this.storageDir, 'clusters.json');
     if (!fs.existsSync(clustersFile)) {
-      fs.writeFileSync(clustersFile, '{}');
+      writeClustersFileAtomic(this.storageDir, {});
     }
     return clustersFile;
   }
@@ -781,6 +786,11 @@ class Orchestrator {
       return;
     }
 
+    // Read-only orchestrators (CLI list/status/logs) must never write the registry.
+    if (this.readonly) {
+      return;
+    }
+
     const clustersFile = this._ensureClustersFile();
     if (!clustersFile) {
       return;
@@ -807,8 +817,7 @@ class Orchestrator {
       // Read existing clusters from file (other processes may have added clusters)
       let existingClusters = {};
       try {
-        const content = fs.readFileSync(clustersFile, 'utf8');
-        existingClusters = JSON.parse(content);
+        existingClusters = readClustersFileSync(this.storageDir);
       } catch (error) {
         console.error('[Orchestrator] Failed to read existing clusters:', error.message);
       }
@@ -845,6 +854,8 @@ class Orchestrator {
           failureInfo: cluster.failureInfo || null,
           // Persist PR mode for completion agent selection
           autoPr: cluster.autoPr || false,
+          // Persist normalized run mode for status/list display
+          runMode: cluster.runMode || null,
           // Persist PR options for resume
           prOptions: cluster.prOptions || null,
           // Persist cluster-scoped command proof configuration for resume and dynamic agents
@@ -880,8 +891,9 @@ class Orchestrator {
         };
       }
 
-      // Write merged data
-      fs.writeFileSync(clustersFile, JSON.stringify(existingClusters, null, 2));
+      // Write merged data atomically (temp file + rename) so no reader can ever
+      // observe a partially-written file.
+      writeClustersFileAtomic(this.storageDir, existingClusters);
       this._log(
         `[Orchestrator] Saved ${this.clusters.size} cluster(s), file now has ${Object.keys(existingClusters).length} total`
       );
@@ -933,7 +945,7 @@ class Orchestrator {
           throw lockErr;
         }
 
-        const data = JSON.parse(fs.readFileSync(clustersFile, 'utf8'));
+        const data = readClustersFileSync(this.storageDir);
 
         for (const [clusterId, clusterData] of Object.entries(data)) {
           if (!knownClusterIds.has(clusterId)) {
@@ -1030,6 +1042,69 @@ class Orchestrator {
   }
 
   /**
+   * Resolve input (issue from provider, file, or text) and reject duplicate active
+   * runs on the same issue. Deliberately allocates NOTHING (no ledger, no isolation,
+   * no cluster registration) so a rejection - duplicate or otherwise - has zero side
+   * effects on disk or in-memory state.
+   * @private
+   * @returns {Promise<{ inputData: Object, issueProviderId: string|null }>}
+   */
+  async _resolveClusterInput(input, options, clusterId) {
+    if (input.issue) {
+      const ProviderClass = detectProvider(
+        input.issue,
+        options.settings || {},
+        options.forceProvider
+      );
+      if (!ProviderClass) {
+        throw new Error(`No issue provider matched input: ${input.issue}`);
+      }
+
+      const provider = new ProviderClass();
+      const inputData = await provider.fetchIssue(input.issue, options.settings || {});
+      const issueNumber = inputData.number || null;
+
+      // Check for duplicate active runs on same issue (unless --force)
+      if (issueNumber && !options.force) {
+        const activeClusters = this._getActiveClustersForIssue(issueNumber, clusterId);
+        if (activeClusters.length > 0) {
+          const existing = activeClusters[0];
+          const age = Math.round((Date.now() - existing.createdAt) / 1000 / 60);
+          throw new DuplicateClusterError(
+            `Issue #${issueNumber} already has an active cluster:\n` +
+              `  Cluster: ${existing.id} (state: ${existing.state}, running for ${age}min, pid: ${existing.pid})\n\n` +
+              `Options:\n` +
+              `  1. Kill existing: zeroshot kill ${existing.id}\n` +
+              `  2. Override check: zeroshot run ${input.issue} --force\n` +
+              `  3. View status:    zeroshot status ${existing.id}`,
+            {
+              issueNumber,
+              existingClusterId: existing.id,
+              existingState: existing.state,
+              existingPid: existing.pid,
+              ageMinutes: age,
+            }
+          );
+        }
+      }
+
+      // Log clickable issue link
+      if (inputData.url) {
+        this._log(`[Orchestrator] Issue (${ProviderClass.displayName}): ${inputData.url}`);
+      }
+
+      return { inputData, issueProviderId: ProviderClass.id };
+    } else if (input.file) {
+      this._log(`[Orchestrator] File: ${input.file}`);
+      return { inputData: InputHelpers.createFileInput(input.file), issueProviderId: null };
+    } else if (input.text) {
+      return { inputData: InputHelpers.createTextInput(input.text), issueProviderId: null };
+    }
+
+    throw new Error('Either issue, file, or text input is required');
+  }
+
+  /**
    * Internal start implementation (shared by start and startWithMock)
    * @private
    */
@@ -1042,6 +1117,15 @@ class Orchestrator {
     const clusterId = this._resolveStartClusterId(
       options.clusterId || null,
       config?.dbPath || null
+    );
+
+    // Resolve input (issue/file/text) and reject duplicate active runs on the same issue
+    // BEFORE allocating any resources. A duplicate-run rejection must have zero side
+    // effects: no ledger db file, no worktree/container, no clusters.json entry.
+    const { inputData, issueProviderId } = await this._resolveClusterInput(
+      input,
+      options,
+      clusterId
     );
 
     // Create ledger and message bus with persistent storage
@@ -1077,10 +1161,13 @@ class Orchestrator {
       createdAt: Date.now(),
       // Track PID for zombie detection (this process owns the cluster)
       pid: process.pid,
+      // Issue number for heroshot/external tools (avoids log parsing)
+      issue: inputData.number || null,
       // Initialization completion tracking (for safe SIGINT handling)
       initCompletePromise,
       _resolveInitComplete: resolveInitComplete,
       autoPr: options.autoPr || false,
+      runMode: options.runMode || null,
       requiredQualityGates,
       commandProofs,
       // PR configuration options (persisted for resume)
@@ -1088,7 +1175,7 @@ class Orchestrator {
       // Model override for all agents (applied to dynamically added agents)
       modelOverride: options.modelOverride || null,
       // Issue provider tracking (where issue was fetched from)
-      issueProvider: null, // Set after fetching issue (github, gitlab, jira, azure-devops)
+      issueProvider: issueProviderId, // null unless input.issue (github, gitlab, jira, azure-devops)
       // Git platform tracking (where PR/MR will be created - independent of issue provider)
       gitPlatform: null, // Set when --pr mode is active
       // Isolation state (only if enabled)
@@ -1126,63 +1213,8 @@ class Orchestrator {
     });
 
     try {
-      // Fetch input (issue from provider, file, or text)
-      let inputData;
-      if (input.issue) {
-        // Detect provider and fetch issue
-        const ProviderClass = detectProvider(
-          input.issue,
-          options.settings || {},
-          options.forceProvider
-        );
-        if (!ProviderClass) {
-          throw new Error(`No issue provider matched input: ${input.issue}`);
-        }
-
-        const provider = new ProviderClass();
-        inputData = await provider.fetchIssue(input.issue, options.settings || {});
-
-        // Store issue provider for logging/debugging and cross-provider workflows
-        cluster.issueProvider = ProviderClass.id;
-
-        // Store issue number for heroshot/external tools (avoids log parsing)
-        cluster.issue = inputData.number || null;
-
-        // Persist issue number early so supervisors can associate this cluster with the issue even if start fails.
-        await this._saveClusters().catch((err) => {
-          console.warn(`[Orchestrator] Failed to persist issue number for ${clusterId}:`, err);
-        });
-
-        // Check for duplicate active runs on same issue (unless --force)
-        if (cluster.issue && !options.force) {
-          const activeClusters = this._getActiveClustersForIssue(cluster.issue, clusterId);
-          if (activeClusters.length > 0) {
-            const existing = activeClusters[0];
-            const age = Math.round((Date.now() - existing.createdAt) / 1000 / 60);
-            throw new Error(
-              `Issue #${cluster.issue} already has an active cluster:\n` +
-                `  Cluster: ${existing.id} (state: ${existing.state}, running for ${age}min, pid: ${existing.pid})\n\n` +
-                `Options:\n` +
-                `  1. Kill existing: zeroshot kill ${existing.id}\n` +
-                `  2. Override check: zeroshot run ${input.issue} --force\n` +
-                `  3. View status:    zeroshot status ${existing.id}`
-            );
-          }
-        }
-
-        // Log clickable issue link
-        if (inputData.url) {
-          this._log(`[Orchestrator] Issue (${ProviderClass.displayName}): ${inputData.url}`);
-        }
-      } else if (input.file) {
-        inputData = InputHelpers.createFileInput(input.file);
-        this._log(`[Orchestrator] File: ${input.file}`);
-      } else if (input.text) {
-        inputData = InputHelpers.createTextInput(input.text);
-      } else {
-        throw new Error('Either issue, file, or text input is required');
-      }
-
+      // Input (issue/file/text) was already resolved and duplicate-checked in
+      // _resolveClusterInput() before any resource was allocated (see above).
       commandProofs = mergeCommandProofs(
         commandProofs,
         resolveClusterCommandProofs(config, options, inputData.context)
@@ -1793,6 +1825,7 @@ class Orchestrator {
       mergeQueue: options.mergeQueue,
       closeIssue: options.closeIssue,
       requiredQualityGates: options.requiredQualityGates,
+      autoMerge: resolveAutoMerge(options),
       cwd: options.cwd,
     });
 
@@ -1908,22 +1941,29 @@ class Orchestrator {
    * @private
    */
   _teardownWorktreeCompose(worktreePath) {
-    const composePath = path.join(worktreePath, 'docker-compose.yml');
-    if (!fs.existsSync(composePath)) return;
+    // NEVER pass --volumes (irreversible data loss) and NEVER tear down a pinned/shared
+    // Compose project — only a project scoped to the worktree directory basename, which is
+    // the only kind zeroshot could itself have created, is touched.
+    const { resolveWorktreeComposeTeardown } = require('../lib/compose-utils');
+    const teardown = resolveWorktreeComposeTeardown(worktreePath);
+    if (!teardown.shouldTeardown) {
+      if (teardown.composePath) {
+        this._log(
+          `[Orchestrator] Skipping Docker Compose teardown in ${worktreePath}: ${teardown.reason}`
+        );
+      }
+      return;
+    }
 
     try {
       this._log(`[Orchestrator] Tearing down Docker Compose services in ${worktreePath}...`);
       const { spawnSync } = require('child_process');
-      const result = spawnSync(
-        'docker',
-        ['compose', 'down', '--remove-orphans', '--volumes', '--timeout', '10'],
-        {
-          cwd: worktreePath,
-          encoding: 'utf8',
-          stdio: 'pipe',
-          timeout: 30000,
-        }
-      );
+      const result = spawnSync('docker', teardown.args, {
+        cwd: worktreePath,
+        encoding: 'utf8',
+        stdio: 'pipe',
+        timeout: 30000,
+      });
       if (result.status !== 0 || result.error) {
         const detail = result.error?.message || result.stderr || 'no stderr';
         throw new Error(`Docker Compose teardown failed in ${worktreePath}: ${detail}`);
@@ -3584,6 +3624,24 @@ Continue from where you left off. Review your previous output to understand what
   }
 
   /**
+   * Read messageCount for a cluster without fabricating a value on failure.
+   * A confirmed zero (ledger read succeeded, cluster has no messages) and a
+   * failed read (ledger unavailable) must stay distinguishable - returning 0
+   * for both is what produced the phantom "failed/msgs=0" state in list/status.
+   * @private
+   */
+  _readMessageCount(cluster, clusterId) {
+    try {
+      return cluster.messageBus.readSnapshot(clusterId).messageCount;
+    } catch (error) {
+      console.error(
+        `[Orchestrator] Failed to read message count for cluster ${clusterId}: ${error.message || String(error)}`
+      );
+      return null;
+    }
+  }
+
+  /**
    * Get cluster status
    * @param {String} clusterId - Cluster ID
    * @returns {Object} Cluster status
@@ -3625,18 +3683,11 @@ Continue from where you left off. Review your previous output to understand what
       pid: cluster.pid || null,
       createdAt: cluster.createdAt,
       agents: cluster.agents.map((a) => a.getState()),
-      messageCount: (() => {
-        try {
-          return cluster.messageBus.count({ cluster_id: clusterId });
-        } catch {
-          // Cluster may have closed its ledger during startup failure cleanup.
-          // Status/list should remain safe to call for visibility + supervisor cleanup.
-          return 0;
-        }
-      })(),
+      messageCount: this._readMessageCount(cluster, clusterId),
       setupLogPath: cluster.setupLogPath || null,
       setupStage: cluster.setupStage || null,
       failureInfo: cluster.failureInfo || null,
+      runMode: cluster.runMode || null,
     };
   }
 
@@ -3665,19 +3716,12 @@ Continue from where you left off. Review your previous output to understand what
         createdAt: cluster.createdAt,
         issue: cluster.issue || null,
         agentCount: cluster.agents.length,
-        messageCount: (() => {
-          try {
-            return cluster.messageBus.count({ cluster_id: cluster.id });
-          } catch {
-            // Cluster may have closed its ledger during startup failure cleanup.
-            // List should remain safe to call for cleanup routines.
-            return 0;
-          }
-        })(),
+        messageCount: this._readMessageCount(cluster, cluster.id),
         pid: cluster.pid || null,
         setupLogPath: cluster.setupLogPath || null,
         setupStage: cluster.setupStage || null,
         failureInfo: cluster.failureInfo || null,
+        runMode: cluster.runMode || null,
       };
     });
   }
@@ -3984,6 +4028,82 @@ Continue from where you left off. Review your previous output to understand what
       dryRun: options.dryRun || false,
     });
   }
+
+  /**
+   * Explicitly detect clusters corrupted by SIGINT during initialization
+   * (state='running' but the ledger never received its first message).
+   *
+   * This replaces the old unconditional 0-message check that used to run inside
+   * _loadClusters() on every list/status call: that check mutated cluster.state
+   * as a side effect of a plain read, and a single racy count() (e.g. against a
+   * writer's just-opened connection) was enough to misclassify a healthy running
+   * cluster as corrupted. This method is only ever invoked explicitly (from the
+   * `gc` CLI flow), never from getStatus()/listClusters(), and requires:
+   *   - the cluster has been running longer than `graceMs` (default 60s), so a
+   *     brand-new cluster whose first message hasn't landed yet isn't flagged, and
+   *   - two independent reads 250ms apart both observe 0 messages, so a single
+   *     transient/racy read can't trigger a false positive.
+   *
+   * @param {object} [options]
+   * @param {number} [options.graceMs=60000]
+   * @returns {Promise<string[]>} IDs newly marked corrupted
+   */
+  async detectCorruptedClusters(options = {}) {
+    const graceMs = typeof options.graceMs === 'number' ? options.graceMs : 60000;
+    const now = Date.now();
+    const corrupted = [];
+
+    for (const cluster of this.clusters.values()) {
+      if (this._isSetupCluster(cluster)) continue;
+      if (cluster.state !== 'running') continue;
+      if (!cluster.createdAt || now - cluster.createdAt < graceMs) continue;
+      if (!cluster.messageBus) continue;
+
+      let firstCount;
+      try {
+        firstCount = cluster.messageBus.count({ cluster_id: cluster.id });
+      } catch (error) {
+        console.warn(
+          `[Orchestrator] Skipping corruption check for ${cluster.id}: ${error.message || String(error)}`
+        );
+        continue;
+      }
+      if (firstCount !== 0) continue;
+
+      await new Promise((resolve) => setTimeout(resolve, 250));
+
+      let secondCount;
+      try {
+        secondCount = cluster.messageBus.count({ cluster_id: cluster.id });
+      } catch (error) {
+        console.warn(
+          `[Orchestrator] Skipping corruption check for ${cluster.id}: ${error.message || String(error)}`
+        );
+        continue;
+      }
+      if (secondCount !== 0) continue;
+
+      console.warn(`[Orchestrator] ⚠️  Cluster ${cluster.id} has 0 messages (corrupted)`);
+      console.warn(`[Orchestrator]    This likely occurred from SIGINT during initialization.`);
+      console.warn(
+        `[Orchestrator]    Marking as 'corrupted' - use 'zeroshot kill ${cluster.id}' to remove.`
+      );
+      cluster.state = 'corrupted';
+      cluster.corruptedReason = 'SIGINT during initialization (0 messages in ledger)';
+      corrupted.push(cluster.id);
+    }
+
+    if (corrupted.length > 0) {
+      await this._saveClusters();
+    }
+
+    return corrupted;
+  }
 }
 
+// Exported for testing (PR options persistence, e.g. autoMerge for --pr vs --ship).
+Orchestrator.buildPrOptions = buildPrOptions;
+Orchestrator.resolveAutoMerge = resolveAutoMerge;
+
 module.exports = Orchestrator;
+module.exports.DuplicateClusterError = DuplicateClusterError;

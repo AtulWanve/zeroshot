@@ -22,6 +22,7 @@ const { URL } = require('url');
 const chalk = require('chalk');
 const Orchestrator = require('../src/orchestrator');
 const { setupCompletion } = require('../lib/completion');
+const { resolveRunMode, describeRunMode } = require('../lib/run-mode');
 const { formatWatchMode } = require('./message-formatters-watch');
 const {
   formatAgentLifecycle,
@@ -48,10 +49,16 @@ const {
 } = require('../lib/settings');
 const { normalizeProviderName } = require('../lib/provider-names');
 const { getProvider, parseProviderChunk } = require('../src/providers');
+const { readClustersFileSync } = require('../lib/clusters-registry');
 const { MOUNT_PRESETS, resolveEnvs } = require('../lib/docker-config');
 const {
   detectGitRepoRoot,
   detectRunInput,
+  isStdinInput,
+  readStdinText,
+  encodeStdinEnv,
+  decodeStdinEnv,
+  buildTextInput,
   loadClusterConfig,
   resolveConfigPath,
   resolveProviderOverride,
@@ -66,10 +73,13 @@ const { runCmdproof } = require('./commands/cmdproof');
 const {
   markDetachedSetupFailed,
   registerDetachedSetupCluster,
+  removeDetachedSetupCluster,
 } = require('../lib/detached-startup');
 // Setup wizard removed - use: zeroshot settings set <key> <value>
 const { checkForUpdates, printLegacyDistroNotice } = require('./lib/update-checker');
+const { checkBinDirOnPath, printPathWarning } = require('../lib/path-check');
 const { StatusFooter, AGENT_STATE, ACTIVE_STATES } = require('../src/status-footer');
+const { EVENT_COPY, formatMergeStatus } = require('./event-copy');
 
 // =============================================================================
 // GLOBAL ERROR HANDLERS - Prevent silent process death
@@ -179,9 +189,10 @@ function normalizeRunOptions(options) {
   if (options.docker) {
     options.worktree = false;
   }
+  options.autoMerge = Boolean(options.ship);
 }
 
-function runClusterPreflight({ input, options, providerOverride, settings, forceProvider }) {
+async function runClusterPreflight({ input, options, providerOverride, settings, forceProvider }) {
   // Detect which issue provider tool is needed
   let issueProvider = null;
   let targetHost = null;
@@ -205,7 +216,7 @@ function runClusterPreflight({ input, options, providerOverride, settings, force
     }
   }
 
-  requirePreflight({
+  await requirePreflight({
     requireGh: issueProvider === 'github', // gh CLI required for GitHub
     requireDocker: options.docker,
     requireGit: options.worktree,
@@ -221,11 +232,8 @@ function shouldRunDetached(options) {
 }
 
 function printDetachedClusterStart(options, clusterId, logPath) {
-  if (options.docker) {
-    console.log(`Started ${clusterId} (docker)`);
-  } else {
-    console.log(`Started ${clusterId}`);
-  }
+  const runMode = resolveRunMode(options);
+  console.log(runMode ? `Started ${clusterId} (${runMode})` : `Started ${clusterId}`);
   if (logPath) {
     console.log(`Setup log: ${logPath}`);
   }
@@ -256,7 +264,7 @@ function resolveMergeQueueEnv(value) {
   return '';
 }
 
-function buildDaemonEnv(options, clusterId, targetCwd) {
+function buildDaemonEnv(options, clusterId, targetCwd, stdinText) {
   const mergeQueueEnv = resolveMergeQueueEnv(options.mergeQueue);
   const runOptionsEnv = serializeRunOptions(options);
   return {
@@ -275,10 +283,11 @@ function buildDaemonEnv(options, clusterId, targetCwd) {
     ZEROSHOT_MERGE_QUEUE: mergeQueueEnv,
     ZEROSHOT_CLOSE_ISSUE: options.closeIssue || '',
     ZEROSHOT_CWD: targetCwd,
+    ZEROSHOT_STDIN_TASK: stdinText !== undefined ? encodeStdinEnv(stdinText) : '',
   };
 }
 
-async function spawnDetachedCluster(options, clusterId) {
+async function spawnDetachedCluster(options, clusterId, stdinText) {
   const { spawn } = require('child_process');
   const logFd = createDaemonLogFile(clusterId);
   const targetCwd = detectGitRepoRoot();
@@ -287,7 +296,7 @@ async function spawnDetachedCluster(options, clusterId) {
     detached: true,
     stdio: ['ignore', logFd, logFd],
     cwd: targetCwd,
-    env: buildDaemonEnv(options, clusterId, targetCwd),
+    env: buildDaemonEnv(options, clusterId, targetCwd, stdinText),
   });
   await registerDetachedSetupCluster({
     clusterId,
@@ -321,13 +330,8 @@ function printForegroundStartInfo(options, clusterId, configName) {
   if (process.env.ZEROSHOT_DAEMON) {
     return;
   }
-  if (options.docker) {
-    console.log(`Starting ${clusterId} (docker)`);
-  } else if (options.worktree) {
-    console.log(`Starting ${clusterId} (worktree)`);
-  } else {
-    console.log(`Starting ${clusterId}`);
-  }
+  const runMode = resolveRunMode(options);
+  console.log(runMode ? `Starting ${clusterId} (${runMode})` : `Starting ${clusterId}`);
   console.log(chalk.dim(`Config: ${configName}`));
   console.log(chalk.dim('Ctrl+C to stop following (cluster keeps running)\n'));
 }
@@ -389,13 +393,14 @@ function applyModelOverrideToConfig(config, modelOverride, providerOverride, set
   console.log(chalk.dim(`Model override: ${modelOverride} (all agents)`));
 }
 
-function createStatusFooter(clusterId, messageBus) {
+function createStatusFooter(clusterId, messageBus, runMode) {
   const statusFooter = new StatusFooter({
     refreshInterval: 1000,
     enabled: process.stdout.isTTY,
   });
   statusFooter.setCluster(clusterId);
   statusFooter.setClusterState('running');
+  statusFooter.setRunMode(runMode);
   statusFooter.setMessageBus(messageBus);
   activeStatusFooter = statusFooter;
   return statusFooter;
@@ -571,11 +576,11 @@ function waitForClusterCompletion(orchestrator, clusterId, cleanup) {
   });
 }
 
-async function streamClusterInForeground(cluster, orchestrator, clusterId) {
+async function streamClusterInForeground(cluster, orchestrator, clusterId, options) {
   const sendersWithOutput = new Set();
   const processedMessageIds = new Set();
 
-  const statusFooter = createStatusFooter(clusterId, cluster.messageBus);
+  const statusFooter = createStatusFooter(clusterId, cluster.messageBus, resolveRunMode(options));
   const handleLifecycleMessage = createLifecycleHandler(statusFooter);
   const lifecycleUnsubscribe = cluster.messageBus.subscribeTopic(
     'AGENT_LIFECYCLE',
@@ -629,22 +634,28 @@ function setupDaemonCleanup(orchestrator, clusterId) {
 }
 
 function readClusterTokenTotals(orchestrator, clusterId) {
-  let totalTokens = 0;
-  let totalCostUsd = 0;
   try {
     const clusterObj = orchestrator.getCluster(clusterId);
-    if (clusterObj?.messageBus) {
-      const tokensByRole = clusterObj.messageBus.getTokensByRole(clusterId);
-      if (tokensByRole?._total?.count > 0) {
-        const total = tokensByRole._total;
-        totalTokens = (total.inputTokens || 0) + (total.outputTokens || 0);
-        totalCostUsd = total.totalCostUsd || 0;
-      }
+    if (!clusterObj?.messageBus) {
+      return { totalTokens: 0, totalCostUsd: 0 };
     }
-  } catch {
-    /* Token tracking not available */
+    const { tokensByRole } = clusterObj.messageBus.readSnapshot(clusterId);
+    const total = tokensByRole?._total;
+    if (!total || total.count === 0) {
+      return { totalTokens: 0, totalCostUsd: 0 };
+    }
+    return {
+      totalTokens: (total.inputTokens || 0) + (total.outputTokens || 0),
+      totalCostUsd: total.totalCostUsd || 0,
+    };
+  } catch (error) {
+    // A confirmed-empty ledger (0) and a failed read must stay distinguishable -
+    // fabricating 0 here is what produced phantom "msgs=0 $0" rows in `list --json`.
+    console.error(
+      `[cli] Failed to read token totals for cluster ${clusterId}: ${error.message || String(error)}`
+    );
+    return { totalTokens: null, totalCostUsd: null };
   }
-  return { totalTokens, totalCostUsd };
 }
 
 function enrichClustersWithTokens(clusters, orchestrator) {
@@ -672,8 +683,9 @@ function formatClusterRow(cluster) {
   const stateDisplay =
     cluster.state === 'zombie' ? chalk.red(cluster.state.padEnd(12)) : cluster.state.padEnd(12);
   const rowColor = cluster.state === 'zombie' ? chalk.red : (text) => text;
+  const modeDisplay = (cluster.runMode || '-').padEnd(10);
 
-  return `${rowColor(cluster.id.padEnd(25))} ${stateDisplay} ${cluster.agentCount
+  return `${rowColor(cluster.id.padEnd(25))} ${stateDisplay} ${modeDisplay} ${cluster.agentCount
     .toString()
     .padEnd(8)} ${tokenDisplay.padEnd(12)} ${costDisplay.padEnd(8)} ${created}`;
 }
@@ -687,11 +699,11 @@ function printClusterTable(enrichedClusters) {
 
   console.log(chalk.bold('\n=== Clusters ==='));
   console.log(
-    `${'ID'.padEnd(25)} ${'State'.padEnd(12)} ${'Agents'.padEnd(8)} ${'Tokens'.padEnd(
-      12
-    )} ${'Cost'.padEnd(8)} Created`
+    `${'ID'.padEnd(25)} ${'State'.padEnd(12)} ${'Mode'.padEnd(10)} ${'Agents'.padEnd(
+      8
+    )} ${'Tokens'.padEnd(12)} ${'Cost'.padEnd(8)} Created`
   );
-  console.log('-'.repeat(100));
+  console.log('-'.repeat(110));
   for (const cluster of enrichedClusters) {
     console.log(formatClusterRow(cluster));
   }
@@ -734,13 +746,16 @@ function reportMissingId(id, options) {
 function getClusterTokensByRole(orchestrator, clusterId) {
   try {
     const cluster = orchestrator.getCluster(clusterId);
-    if (cluster?.messageBus) {
-      return cluster.messageBus.getTokensByRole(clusterId);
+    if (!cluster?.messageBus) {
+      return null;
     }
-  } catch {
-    /* Token tracking not available */
+    return cluster.messageBus.readSnapshot(clusterId).tokensByRole;
+  } catch (error) {
+    console.error(
+      `[cli] Failed to read tokens by role for cluster ${clusterId}: ${error.message || String(error)}`
+    );
+    return null;
   }
-  return null;
 }
 
 function printClusterStatusJson(status, tokensByRole) {
@@ -773,6 +788,9 @@ function printClusterStatusHeader(status, clusterId) {
     );
   } else {
     console.log(`State: ${status.state}`);
+  }
+  if (status.runMode) {
+    console.log(`Mode: ${describeRunMode(status.runMode)}`);
   }
   if (status.pid) {
     console.log(`PID: ${status.pid}`);
@@ -1216,9 +1234,26 @@ function followSetupLog(logPath) {
 }
 
 function printRecentMessages(messages, limit, isActive, options) {
-  const recentMessages = messages.slice(-limit);
-  for (const msg of recentMessages) {
-    printMessage(msg, true, options.watch, isActive);
+  if (options.watch) {
+    const recentMessages = selectRecentPrintableMessages(messages, limit);
+    for (const msg of recentMessages) {
+      printMessage(msg, true, true, isActive);
+    }
+    if (recentMessages.length === 0 && messages.length > 0) {
+      console.log(chalk.dim(`No printable history in ${messages.length} stored messages.`));
+    }
+    return;
+  }
+
+  const output = renderRecentMessagesToTerminal(messages, limit);
+
+  if (output) {
+    console.log(output);
+    return;
+  }
+
+  if (messages.length > 0) {
+    console.log(chalk.dim(`No printable history in ${messages.length} stored messages.`));
   }
 }
 
@@ -1461,9 +1496,8 @@ async function printAttachableClusters(clusters, socketDiscovery) {
 }
 
 function readClusterFromDisk(id) {
-  const clustersFile = path.join(os.homedir(), '.zeroshot', 'clusters.json');
   try {
-    const clusters = JSON.parse(fs.readFileSync(clustersFile, 'utf8'));
+    const clusters = readClustersFileSync(path.join(os.homedir(), '.zeroshot'));
     return clusters[id] || null;
   } catch {
     return null;
@@ -1554,7 +1588,7 @@ async function resolveClusterSocketPath(id, options, socketDiscovery) {
   const cluster = readClusterFromDisk(id);
   ensureClusterRunning(cluster, id);
 
-  const orchestrator = await Orchestrator.create({ quiet: true });
+  const orchestrator = await Orchestrator.create({ quiet: true, readonly: true });
   try {
     const status = orchestrator.getStatus(id);
     const activeAgents = getActiveAgents(status);
@@ -2028,6 +2062,31 @@ function getOrchestrator() {
   return _orchestratorPromise;
 }
 
+// Separate lazy-loaded read-only orchestrator for commands that only ever read
+// cluster state (list/status/logs). Read-only ledgers can never contend with a
+// live daemon's writer connection or mutate clusters.json as a side effect.
+/** @type {import('../src/orchestrator') | null} */
+let _readonlyOrchestrator = null;
+/** @type {Promise<import('../src/orchestrator')> | null} */
+let _readonlyOrchestratorPromise = null;
+/**
+ * @returns {Promise<import('../src/orchestrator')>}
+ */
+function getReadonlyOrchestrator() {
+  if (_readonlyOrchestrator) {
+    return Promise.resolve(_readonlyOrchestrator);
+  }
+  if (!_readonlyOrchestratorPromise) {
+    _readonlyOrchestratorPromise = Orchestrator.create({ quiet: true, readonly: true }).then(
+      (orch) => {
+        _readonlyOrchestrator = orch;
+        return orch;
+      }
+    );
+  }
+  return _readonlyOrchestratorPromise;
+}
+
 /**
  * @typedef {Object} TaskLogMessage
  * @property {string} topic
@@ -2323,7 +2382,9 @@ Shell completion:
 // Run command - CLUSTER with auto-detection
 program
   .command('run <input>')
-  .description('Start a multi-agent cluster (GitHub issue, markdown file, or plain text)')
+  .description(
+    'Start a multi-agent cluster (GitHub issue, markdown file, plain text, or "-" for stdin)'
+  )
   .option('--config <file>', 'Path to cluster config JSON (default: conductor-bootstrap)')
   .option('--docker', 'Run cluster inside Docker container (full isolation)')
   .option('--worktree', 'Use git worktree for isolation (lightweight, no Docker required)')
@@ -2337,7 +2398,7 @@ program
   )
   .option(
     '--pr',
-    'Create PR for human review (uses worktree isolation by default, use --docker for Docker)'
+    'Create PR for human review (uses worktree isolation by default, use --docker for Docker). Never auto-merges itself; a repo-side branch-protection auto-merge rule or merge queue may still merge the PR independently of zeroshot.'
   )
   .option(
     '--ship',
@@ -2364,6 +2425,7 @@ program
   .option('-L, --gitlab', 'Force GitLab as issue source')
   .option('-J, --jira', 'Force Jira as issue source')
   .option('-D, --devops', 'Force Azure DevOps as issue source')
+  .option('-N, --linear', 'Force Linear as issue source')
   .option('-d, --detach', 'Run in background (default: attach to first agent)')
   .option('--mount <spec...>', 'Add Docker mount (host:container[:ro]). Repeatable.')
   .option('--no-mounts', 'Disable all Docker credential mounts')
@@ -2391,11 +2453,20 @@ Input formats:
   Azure DevOps:
     https://dev.azure.com/org/proj/_workitems/edit/123
 
+  Linear:
+    ENG-42                            Issue key
+    https://linear.app/<workspace>/issue/ENG-42/...
+
   File/Text:
     feature.md                       Markdown file
     "Implement feature X"            Plain text task
 
-Force provider flags: -G (GitHub), -L (GitLab), -J (Jira), -D (DevOps)
+  Stdin:
+    -                                 Read task body from stdin (pipe/redirect)
+      pbpaste | zeroshot run -
+      zeroshot run - < issue.md
+
+Force provider flags: -G (GitHub), -L (GitLab), -J (Jira), -D (DevOps), -N (Linear)
 `
   )
   .action(async (inputArg, options) => {
@@ -2409,14 +2480,41 @@ Force provider flags: -G (GitHub), -L (GitLab), -J (Jira), -D (DevOps)
       else if (options.gitlab) forceProvider = 'gitlab';
       else if (options.jira) forceProvider = 'jira';
       else if (options.devops) forceProvider = 'azure-devops';
+      else if (options.linear) forceProvider = 'linear';
+
+      // Stdin input ('-'): read task body from stdin to avoid shell-quoting breakage
+      let stdinText;
+      if (isStdinInput(inputArg)) {
+        if (process.env.ZEROSHOT_DAEMON === '1') {
+          const encoded = process.env.ZEROSHOT_STDIN_TASK;
+          if (!encoded) {
+            throw new Error('zeroshot run -: daemon mode missing forwarded stdin content');
+          }
+          stdinText = decodeStdinEnv(encoded);
+        } else if (process.stdin.isTTY) {
+          throw new Error(
+            'zeroshot run -: no piped input detected. Pipe or redirect a task body, e.g.\n' +
+              '  pbpaste | zeroshot run -\n' +
+              '  zeroshot run - < issue.md'
+          );
+        } else {
+          stdinText = await readStdinText();
+        }
+        if (!stdinText) {
+          throw new Error('zeroshot run -: stdin was empty, no task content received');
+        }
+      }
 
       // Auto-detect input type
-      const input = detectRunInput(inputArg);
       const settings = loadSettings();
+      const input =
+        stdinText !== undefined
+          ? buildTextInput(stdinText)
+          : detectRunInput(inputArg, settings, forceProvider);
       const providerOverride = resolveProviderOverride(options);
 
       // Preflight checks
-      runClusterPreflight({ input, options, providerOverride, settings, forceProvider });
+      await runClusterPreflight({ input, options, providerOverride, settings, forceProvider });
 
       // Secondary preflight: token-free template simulation/validation
       const simMode = String(options.sim || 'fast').toLowerCase();
@@ -2446,7 +2544,7 @@ Force provider flags: -G (GitHub), -L (GitLab), -J (Jira), -D (DevOps)
 
       if (shouldRunDetached(options)) {
         const clusterId = generateName('cluster');
-        await spawnDetachedCluster(options, clusterId);
+        await spawnDetachedCluster(options, clusterId, stdinText);
         return;
       }
 
@@ -2511,11 +2609,28 @@ Force provider flags: -G (GitHub), -L (GitLab), -J (Jira), -D (DevOps)
       }
 
       if (!process.env.ZEROSHOT_DAEMON) {
-        await streamClusterInForeground(cluster, orchestrator, clusterId);
+        await streamClusterInForeground(cluster, orchestrator, clusterId, options);
       }
 
       setupDaemonCleanup(orchestrator, clusterId);
     } catch (error) {
+      if (error.code === 'DUPLICATE_CLUSTER') {
+        // Benign guard rejection, not a crash: nothing was allocated, so there is
+        // nothing to roll back. No stack trace, no "Error:" framing.
+        if (process.env.ZEROSHOT_DAEMON && process.env.ZEROSHOT_CLUSTER_ID) {
+          try {
+            await removeDetachedSetupCluster({
+              clusterId: process.env.ZEROSHOT_CLUSTER_ID,
+              storageDir: path.join(os.homedir(), '.zeroshot'),
+            });
+          } catch (removeError) {
+            console.error('Failed to remove provisional setup cluster:', removeError.message);
+          }
+        }
+        console.log(chalk.yellow(error.message));
+        process.exit(1);
+      }
+
       if (process.env.ZEROSHOT_DAEMON && process.env.ZEROSHOT_CLUSTER_ID) {
         try {
           await markDetachedSetupFailed({
@@ -2585,7 +2700,7 @@ taskCmd
       const providerOverride = normalizeProviderName(
         options.provider || process.env.ZEROSHOT_PROVIDER || settings.defaultProvider
       );
-      requirePreflight({
+      await requirePreflight({
         requireGh: false, // gh not needed for plain tasks
         requireDocker: false, // Docker not needed for plain tasks
         quiet: false,
@@ -2629,7 +2744,7 @@ program
   .option('--json', 'Output as JSON')
   .action(async (options) => {
     try {
-      const orchestrator = await getOrchestrator();
+      const orchestrator = await getReadonlyOrchestrator();
       const clusters = filterClustersByStatus(orchestrator.listClusters(), options.status);
       const enrichedClusters = enrichClustersWithTokens(clusters, orchestrator);
 
@@ -2667,7 +2782,7 @@ program
       }
 
       if (type === 'cluster') {
-        const orchestrator = await getOrchestrator();
+        const orchestrator = await getReadonlyOrchestrator();
         const status = orchestrator.getStatus(id);
         const tokensByRole = getClusterTokensByRole(orchestrator, id);
         if (options.json) {
@@ -2725,7 +2840,7 @@ program
       }
 
       const limit = parseLogLimit(options);
-      const quietOrchestrator = await Orchestrator.create({ quiet: true });
+      const quietOrchestrator = await Orchestrator.create({ quiet: true, readonly: true });
 
       if (!id) {
         showAllClusterLogs(quietOrchestrator, options, limit);
@@ -2949,9 +3064,9 @@ program
 program
   .command('export <cluster-id>')
   .description('Export cluster conversation')
-  .option('-f, --format <format>', 'Export format: json, markdown, pdf', 'pdf')
-  .option('-o, --output <file>', 'Output file (auto-generated for pdf)')
-  .action(async (clusterId, options) => {
+  .option('-f, --format <format>', 'Export format: json, markdown, html', 'html')
+  .option('-o, --output <file>', 'Output file (auto-generated for html)')
+  .action((clusterId, options) => {
     try {
       // Get messages from DB
       const Ledger = require('../src/ledger');
@@ -2993,10 +3108,12 @@ program
         return;
       }
 
-      // PDF export - convert ANSI to HTML, then render it to PDF
-      const outputFile = options.output || `${clusterId}.pdf`;
+      // HTML export - convert ANSI to a self-contained, print-ready HTML file.
+      // Open it in any browser and use Print -> Save as PDF for a PDF copy.
+      // `pdf` is accepted as a migration alias for the previous puppeteer-based export.
+      const isLegacyPdfFormat = options.format === 'pdf';
+      const outputFile = options.output || `${clusterId}.html`;
       const AnsiToHtml = require('ansi-to-html');
-      const { default: puppeteer } = await import('puppeteer');
 
       const ansiConverter = new AnsiToHtml({
         fg: '#d4d4d4',
@@ -3042,27 +3159,13 @@ program
           </body>
         </html>`;
 
-      const browser = await puppeteer.launch();
-      try {
-        const page = await browser.newPage();
-        await page.setContent(fullHtml, { waitUntil: 'networkidle0' });
-        const pdf = await page.pdf({
-          format: 'A4',
-          landscape: true,
-          margin: {
-            top: '10mm',
-            right: '10mm',
-            bottom: '10mm',
-            left: '10mm',
-          },
-          printBackground: true,
-        });
-
-        require('fs').writeFileSync(outputFile, pdf);
-      } finally {
-        await browser.close();
-      }
+      require('fs').writeFileSync(outputFile, fullHtml, 'utf8');
       console.log(`Exported to ${outputFile}`);
+      if (isLegacyPdfFormat) {
+        console.log(
+          'Note: PDF export now produces print-ready HTML. Open it in a browser and use Print -> Save as PDF.'
+        );
+      }
     } catch (error) {
       console.error('Error exporting cluster:', error.message);
       process.exit(1);
@@ -3096,7 +3199,7 @@ program
           cluster.config?.defaultProvider ||
           settings.defaultProvider;
 
-        requirePreflight({
+        await requirePreflight({
           requireGh: false, // Resume doesn't fetch new issues
           requireDocker: requiresDocker,
           quiet: false,
@@ -3228,7 +3331,7 @@ program
           // If task store is unavailable, fall back to default provider
         }
 
-        requirePreflight({
+        await requirePreflight({
           requireGh: false,
           requireDocker: false,
           quiet: false,
@@ -3334,6 +3437,23 @@ async function runGc(dryRun) {
   }
 }
 
+async function detectAndReportCorruptedClusters(dryRun) {
+  if (dryRun) {
+    return;
+  }
+  try {
+    const orchestrator = await getOrchestrator();
+    const corrupted = await orchestrator.detectCorruptedClusters();
+    if (corrupted.length > 0) {
+      console.log(chalk.yellow(`\nFound ${corrupted.length} corrupted cluster(s):`));
+      corrupted.forEach((id) => console.log(chalk.yellow(`  ${id}`)));
+      console.log(chalk.dim(`Run 'zeroshot kill <id>' to remove them.`));
+    }
+  } catch (error) {
+    console.error(`Error detecting corrupted clusters: ${error.message}`);
+  }
+}
+
 program
   .command('gc')
   .description('Clean up orphaned worktree directories and stale database files')
@@ -3341,6 +3461,7 @@ program
   .action(async (options) => {
     try {
       printGcResult(await runGc(options.dryRun), options.dryRun);
+      await detectAndReportCorruptedClusters(options.dryRun);
     } catch (error) {
       console.error('Error during garbage collection:', error.message);
       process.exit(1);
@@ -3514,9 +3635,11 @@ function printNonDockerSettings(settings) {
     if (dockerKeys.has(key)) {
       continue;
     }
+    const displayValue =
+      key === 'linearApiKey' && value ? `${String(value).slice(0, 7)}***` : value;
     const isDefault = JSON.stringify(DEFAULT_SETTINGS[key]) === JSON.stringify(value);
     const label = isDefault ? chalk.dim(key) : chalk.cyan(key);
-    const val = isDefault ? chalk.dim(String(value)) : chalk.white(String(value));
+    const val = isDefault ? chalk.dim(String(displayValue)) : chalk.white(String(displayValue));
     console.log(`  ${label.padEnd(30)} ${val}`);
   }
 }
@@ -4788,7 +4911,9 @@ function handleIssueOpenedRender({ msg, prefix, timestamp, lines }) {
 }
 
 function handleImplementationReadyRender({ prefix, timestamp, lines }) {
-  lines.push(`${prefix} ${chalk.gray(timestamp)} ${chalk.bold.yellow('✅ IMPLEMENTATION READY')}`);
+  lines.push(
+    `${prefix} ${chalk.gray(timestamp)} ${chalk.bold.yellow(`✅ ${EVENT_COPY.IMPLEMENTATION_READY.toUpperCase()}`)}`
+  );
 }
 
 function normalizeIssueList(rawIssues) {
@@ -4857,12 +4982,17 @@ function handleValidationResultRender({ msg, prefix, timestamp, lines }) {
 function handlePrCreatedRender({ msg, prefix, timestamp, lines }) {
   lines.push('');
   lines.push(chalk.bold.green('─'.repeat(80)));
-  lines.push(`${prefix} ${chalk.gray(timestamp)} ${chalk.bold.green('🔗 PR CREATED')}`);
+  lines.push(
+    `${prefix} ${chalk.gray(timestamp)} ${chalk.bold.green(`🔗 ${EVENT_COPY.PR_CREATED.toUpperCase()}`)}`
+  );
   if (msg.content?.data?.pr_url) {
     lines.push(`${prefix} ${chalk.cyan(msg.content.data.pr_url)}`);
   }
-  if (msg.content?.data?.merged) {
-    lines.push(`${prefix} ${chalk.bold.cyan('✓ MERGED')}`);
+  const mergeStatus = formatMergeStatus(msg.content?.data?.merged);
+  if (mergeStatus) {
+    lines.push(
+      `${prefix} ${chalk.gray('Merge:')} ${mergeStatus === 'merged' ? chalk.bold.cyan(mergeStatus) : chalk.yellow(mergeStatus)}`
+    );
   }
   lines.push(chalk.bold.green('─'.repeat(80)));
 }
@@ -4945,7 +5075,15 @@ function handleAgentOutputRender({ msg, prefix, lines, buffers, toolCalls }) {
     }
     if (event.type === 'tool_result') {
       appendAgentToolResultEvent(lines, msg.sender, prefix, toolCalls, event);
+      continue;
     }
+    if (event.type === 'result') {
+      appendAgentResultEvent(lines, prefix, event);
+    }
+  }
+
+  if (events.length === 0) {
+    appendRawAgentOutputLines(lines, prefix, content);
   }
 }
 
@@ -4959,6 +5097,63 @@ const RENDER_TOPIC_HANDLERS = {
   AGENT_ERROR: handleAgentErrorRender,
   AGENT_OUTPUT: handleAgentOutputRender,
 };
+
+const HISTORY_NOISE_TOPICS = new Set(['STATE_SNAPSHOT', 'TOKEN_USAGE']);
+
+function appendAgentResultEvent(lines, prefix, event) {
+  if (!event.success) {
+    lines.push(`${prefix} ${chalk.bold.red('✗ Error:')} ${event.error || 'Task failed'}`);
+    return;
+  }
+
+  const usage = [];
+  if (Number.isFinite(event.inputTokens)) usage.push(`${event.inputTokens} in`);
+  if (Number.isFinite(event.outputTokens)) usage.push(`${event.outputTokens} out`);
+
+  const suffix = usage.length > 0 ? ` (${usage.join(', ')})` : '';
+  lines.push(`${prefix} ${chalk.green('✓')} completed${suffix}`);
+}
+
+function appendRawAgentOutputLines(lines, prefix, content) {
+  for (const line of String(content).split('\n')) {
+    const trimmed = line.trim();
+    if (shouldSkipAgentOutputLine(trimmed)) continue;
+    lines.push(`${prefix} ${line}`);
+  }
+}
+
+function agentOutputHasPrintableHistory(msg) {
+  const content = msg.content?.data?.line || msg.content?.data?.chunk || msg.content?.text;
+  if (!content || !content.trim()) return false;
+
+  const provider = normalizeProviderName(
+    msg.content?.data?.provider || msg.sender_provider || 'claude'
+  );
+  const events = parseProviderChunk(provider, content);
+  if (events.length === 0) {
+    return String(content)
+      .split('\n')
+      .some((line) => !shouldSkipAgentOutputLine(line.trim()));
+  }
+
+  return events.some((event) =>
+    ['text', 'thinking', 'thinking_start', 'tool_call', 'tool_result', 'result'].includes(
+      event.type
+    )
+  );
+}
+
+function isPrintableHistoryMessage(msg) {
+  if (!msg?.topic || HISTORY_NOISE_TOPICS.has(msg.topic)) return false;
+  if (msg.topic === 'AGENT_OUTPUT') return agentOutputHasPrintableHistory(msg);
+  return true;
+}
+
+function selectRecentPrintableMessages(messages, limit) {
+  const printableMessages = messages.filter(isPrintableHistoryMessage);
+  if (!Number.isFinite(limit) || limit <= 0) return printableMessages;
+  return printableMessages.slice(-limit);
+}
 
 /**
  * Render messages to terminal-style output with ANSI colors (same as zeroshot logs)
@@ -4985,6 +5180,13 @@ function renderMessagesToTerminal(clusterId, messages) {
   flushAllRenderBuffers(lines, buffers);
 
   return lines.join('\n');
+}
+
+function renderRecentMessagesToTerminal(messages, limit) {
+  const selectedMessages = selectRecentPrintableMessages(messages, limit);
+  if (selectedMessages.length === 0) return '';
+
+  return renderMessagesToTerminal(null, selectedMessages);
 }
 
 // Get terminal width for word wrapping
@@ -5412,6 +5614,15 @@ async function main() {
 
   printLegacyDistroNotice();
 
+  try {
+    const { onPath, binDir } = checkBinDirOnPath();
+    if (!onPath && binDir) {
+      printPathWarning(binDir);
+    }
+  } catch {
+    // Never block CLI startup on a PATH check failure
+  }
+
   // Check for updates (non-blocking if offline)
   if (!isTest) {
     await checkForUpdates({ quiet: isQuiet });
@@ -5447,7 +5658,11 @@ async function main() {
 }
 
 // Run main
-main().catch((err) => {
-  console.error('Fatal error:', err.message);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error('Fatal error:', err.message);
+    process.exit(1);
+  });
+}
+
+module.exports = { renderRecentMessagesToTerminal, resolveRunMode };
