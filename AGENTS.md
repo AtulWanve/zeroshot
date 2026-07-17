@@ -21,31 +21,183 @@ Destructive commands (need permission): `zeroshot kill`, `zeroshot clear`, `zero
 
 ## Where to Look
 
-| Concept                  | File                                          |
-| ------------------------ | --------------------------------------------- |
-| Conductor classification | `src/conductor-bootstrap.js`                  |
-| Base templates           | `cluster-templates/base-templates/`           |
-| Message bus              | `src/message-bus.js`                          |
-| Ledger (SQLite)          | `src/ledger.js`                               |
-| Guidance topics          | `src/guidance-topics.js`                      |
-| Guidance mailbox helper  | `src/ledger.js`                               |
-| Guidance live injection  | `src/orchestrator.js`                         |
-| Trigger evaluation       | `src/logic-engine.js`                         |
-| Agent wrapper            | `src/agent-wrapper.js`                        |
-| Providers registry       | `src/providers/index.js`                      |
-| Provider implementations | `src/providers/`                              |
-| Provider engine registry | `src/agent-cli-provider/provider-registry.ts` |
-| Gateway runner           | `src/agent-cli-provider/gateway-runner.ts`    |
-| Gateway tools/policy     | `src/agent-cli-provider/gateway-tools.ts`     |
-| Provider detection       | `lib/provider-detection.js`                   |
-| Provider capabilities    | `src/providers/capabilities.js`               |
-| Start-cluster helper     | `lib/start-cluster.js`                        |
-| Docker mounts/env        | `lib/docker-config.js`                        |
-| Container lifecycle      | `src/isolation-manager.js`                    |
-| Settings                 | `lib/settings.js`                             |
+| Concept                     | File                                                                 |
+| --------------------------- | -------------------------------------------------------------------- |
+| Conductor classification    | `src/conductor-bootstrap.js`                                         |
+| Base templates              | `cluster-templates/base-templates/`                                  |
+| Message bus                 | `src/message-bus.js`                                                 |
+| Ledger (SQLite)             | `src/ledger.js`                                                      |
+| Guidance topics             | `src/guidance-topics.js`                                             |
+| Guidance mailbox helper     | `src/ledger.js`                                                      |
+| Guidance live injection     | `src/orchestrator.js`                                                |
+| Trigger evaluation          | `src/logic-engine.js`                                                |
+| Agent wrapper               | `src/agent-wrapper.js`                                               |
+| Providers registry          | `src/providers/index.js`                                             |
+| Provider implementations    | `src/providers/`                                                     |
+| Provider engine registry    | `src/agent-cli-provider/provider-registry.ts`                        |
+| Gateway runner              | `src/agent-cli-provider/gateway-runner.ts`                           |
+| Gateway tools/policy        | `src/agent-cli-provider/gateway-tools.ts`                            |
+| Provider detection          | `lib/provider-detection.js`                                          |
+| Provider capabilities       | `src/providers/capabilities.js`                                      |
+| Start-cluster helper        | `lib/start-cluster.js`                                               |
+| Legacy worker facade        | `lib/cluster-worker/`                                                |
+| Legacy worker executable    | `bin/zeroshot-cluster-worker.js`                                     |
+| Docker mounts/env           | `lib/docker-config.js`                                               |
+| Container lifecycle         | `src/isolation-manager.js`                                           |
+| Settings                    | `lib/settings.js`                                                    |
+| Cluster wire/domain types   | `crates/openengine-cluster-protocol/`                                |
+| Admission wire semantics    | `crates/openengine-cluster-protocol/src/admission.rs`                |
+| Graph AST/bindings/guards   | `crates/openengine-cluster-protocol/src/graph.rs`                    |
+| Closed payload algebra      | `crates/openengine-cluster-protocol/src/payload.rs`                  |
+| Closed payload validation   | `crates/openengine-cluster-protocol/src/payload_value.rs`            |
+| Compiled IR/identity        | `crates/openengine-cluster-protocol/src/canonical.rs`                |
+| Artifact receipts           | `crates/openengine-cluster-protocol/src/artifact.rs`                 |
+| Graph diagnostics/bounds    | `crates/openengine-cluster-protocol/src/diagnostic.rs`               |
+| Shared wire-value bounds    | `crates/openengine-cluster-protocol/src/value.rs`                    |
+| Cluster dispatch/stdio      | `crates/openengine-cluster-server/`                                  |
+| Graph verifier facade       | `crates/openengine-cluster-server/src/graph_verifier.rs`             |
+| Graph verifier analysis     | `crates/openengine-cluster-server/src/graph_verifier/`               |
+| Native product construction | `zeroshot-rust/`                                                     |
+| Artifact store port/fake    | `zeroshot-rust/src/artifact_store.rs`, `artifact_store/fake.rs`      |
+| Product-local artifact CAS  | `zeroshot-rust/src/artifact_store/local_cas.rs`, `local_cas/`        |
+| Issue provider contracts    | `zeroshot-rust/src/issue_provider.rs`, `issue_provider/`             |
+| Source provider contracts   | `zeroshot-rust/src/source_code_provider.rs`, `source_code_provider/` |
+| Provider value bounds       | `zeroshot-rust/src/provider_value.rs`, `provider_value/`             |
+| Native safe faults          | `zeroshot-rust/src/fault.rs`                                         |
+| Native fault taxonomy       | `zeroshot-rust/src/fault/taxonomy.rs`                                |
+| Native diagnostic redaction | `zeroshot-rust/src/fault/redaction.rs`                               |
+| Native observability        | `zeroshot-rust/src/observability.rs`                                 |
+| Admission coordinator       | `crates/openengine-cluster-server/src/admission.rs`                  |
+| Admission durable ports     | `crates/openengine-cluster-server/src/admission/ports.rs`            |
+| Admission snapshot folding  | `crates/openengine-cluster-server/src/admission/snapshot.rs`         |
+| Lifecycle state machine     | `crates/openengine-cluster-server/src/lifecycle.rs`                  |
+| Lifecycle durable ports     | `crates/openengine-cluster-server/src/lifecycle/ports.rs`            |
+| Cluster typed transports    | `crates/openengine-cluster-client/`                                  |
+| Cluster fixtures/artifacts  | `crates/openengine-cluster-testkit/`                                 |
+| Scripted admission fixtures | `crates/openengine-cluster-testkit/src/admission.rs`                 |
+| Fixture inspection controls | `crates/openengine-cluster-testkit/src/admission/inspection.rs`      |
+| Scripted lifecycle helpers  | `crates/openengine-cluster-testkit/src/lifecycle.rs`                 |
+| Lifecycle fixture params    | `crates/openengine-cluster-testkit/src/lifecycle/params.rs`          |
+| Admission transcript output | `crates/openengine-cluster-testkit/src/admission_artifacts.rs`       |
+| Negative graph vectors      | `crates/openengine-cluster-testkit/src/negative_graph_fixtures.rs`   |
+| Verifier vectors            | `crates/openengine-cluster-testkit/src/graph_verifier_artifacts.rs`  |
+| Graph contract prose        | `docs/openengine-cluster-protocol/v1/graph-contract.md`              |
+| Admission contract prose    | `docs/openengine-cluster-protocol/v1/admission.md`                   |
+| Lifecycle contract prose    | `docs/openengine-cluster-protocol/v1/lifecycle.md`                   |
+| Generated graph fixtures    | `protocol/openengine-cluster/v1/fixtures/graph/`                     |
+
+Cluster Protocol Rust types are the source of truth. Files under
+`protocol/openengine-cluster/v1/` are generated projections; update them with
+`cargo run -p openengine-cluster-testkit --bin generate-cluster-protocol -- --write` and
+verify byte-for-byte drift with `npm run protocol:check`. These generator-formatted artifacts
+are excluded from Prettier; never format them independently.
+The protocol and server crates own wire contracts, backend traits, the dispatcher, and transports.
+`zeroshot-rust/` owns the concrete `NativeBackend`, product-local `NativeBackendFactory`
+construction root, product-private artifact byte-store port/local CAS, and product-private,
+secret-free issue/source provider contracts. Artifact stages, bytes, roots, filesystem paths,
+locks, and manifests remain product-private; only verified protocol `ArtifactRef` receipts cross
+the engine boundary. `LocalCasArtifactStore` takes an explicit root, is a single-writer local
+filesystem store, and must preserve ref-first release plus synchronized blob-then-ref publication.
+Issue and source registries and identifiers remain independent; neither is a worker/model provider.
+Keep protocol, transport, daemon, compatibility, adapter, credential resolution, ledger, and
+workspace behavior outside it.
+Native engine faults must be constructed only by `FaultFactory` from closed `ModuleEvidence`.
+Decoded faults must match the canonical semantics derived from their required primary source frame.
+Raw diagnostic values are replaced wholesale with typed markers and remain ephemeral; never put
+them in `EngineFault`, observations, protocol responses, persistence, or exports. Observability is
+injected through `ObservationSink` and uses only the fixed metrics and closed dimensions in
+`observability.rs`; retry disposition is descriptive data, not retry authorization. Do not install
+global telemetry state or caller-defined labels.
+Graph syntax, payload subtyping, compiled IR, diagnostics, and artifact receipt Rust types remain
+authoritative protocol contracts. `ProductionGraphVerifier` is the one reusable production
+semantic verifier for `openengine.graph.full/v1`; it resolves workers through `WorkerRegistry` and
+adds proven `StructuralBounds` without replacing the authoritative AST/IR. It does not admit,
+store, schedule, or execute graphs. `ScriptedVerifier` remains a test-only admission fixture.
+Full-v1 ceilings are fixed public constants beside `ProductionGraphVerifier`, not product
+configuration. Node timeouts use the wire `PositiveInteger` range and have no 24-hour verifier
+ceiling.
+Full-v1 finite control enumeration couples each executable's signals and error as mutually
+exclusive outcomes, including per-item map aggregates. Choice residual assignments govern output
+channel availability; terminal alternatives do not flow into later nodes. Mapped control flow
+preserves per-item execution correlation: guaranteed sequential, full-completion parallel, and
+do-while descendants emit an outcome, while conditional descendants emit one exactly on their
+selected residual route. An `otherwise` node is illegal when earlier branches exhaust the legal
+control space and is excluded from flow analysis.
+`k_of_n` and `k_of_map` labels never widen their selectors' closed domains. Executable writes
+remain success-conditional until residual control excludes every runtime error; state reads and
+promotions preserve that outcome provenance. Definition flow carries exact path/type guarantees
+from required initial input through nested groups. A successful output/diagnostic binding defines
+only its required selected path and required descendants, never optional producer paths.
+V1 has no whole-payload binding: executable inputs and `succeed` outputs must be `null` or records.
+Scalar, enum, and array payloads remain valid in other algebra positions and as nested record
+fields. A map body write to a promoted `array<T>` path writes one `T` at the current input index;
+the result is input-ordered and total, with empty input defining `[]`, while mapped executable
+success/error provenance remains until control excludes every mapped runtime error.
+Parallel continuation requires all branches for `all`, one for `any`/`first`, and `count` for
+`quorum`; quorum flow and promotions are guaranteed only when present in every jointly satisfiable
+size-`count` completion set. Shared guard correlations can make independently possible branch
+completions mutually exclusive and must be preserved during that analysis. Correlate
+`joined=reached|quorum_unreachable` for `all`/`any`/`quorum` with the required branch-completion
+predicate; mapped join controls retain that correlation with branch controls per item before their
+counts are aggregated. Impossible status/control combinations are excluded from guard analysis. Parallel failure labels
+`quorum_unreachable` and `no_satisfier` restore the incoming pre-par definitions and expose no
+winner or branch-promotion data. Unguarded continuation cannot consume success-only parallel
+writes. Preserve target-granular conditional ownership through nested parallels, choice merges,
+and later sequential writers; descendant writes must invalidate stale ancestor type facts.
+For `first`, only a completing branch that guarantees the controls read by `when` and satisfies the
+predicate is a winner; correlate `raced=satisfied|no_satisfier` with those winner assignments.
+The admission coordinator provides stateful plan/apply/get semantics through injected ports.
+Testkit scripted approval and `running` phase mean admitted state, not native verification or a
+production full-graph executor.
+Authoritative admission snapshots fail closed: `empty` has no durable fields, `running` has the
+complete matching control/seed tuple, and transient `admitting` preserves one of those two shapes.
+Operational suspend is a dispatch gate: existing leases may land verified I/O, but successors wait
+for resume. Drain waits without inventing graph hooks; force cancels and voids leases without
+fabricating output. Each stopped run has one final `finished` event. Stop acknowledgements never
+claim rollback or absence of external side effects. These are deterministic scripted-backend
+semantics, not a native graph scheduler or worker executor.
 
 The TUI is not included in this release. Use `zeroshot list`, `zeroshot status <id>`,
 and `zeroshot logs <id> -f` or `zeroshot logs <id> -w` for monitoring.
+
+### Cluster Worker Contracts
+
+| Concept                    | File                                                       |
+| -------------------------- | ---------------------------------------------------------- |
+| Worker descriptors         | `crates/openengine-cluster-protocol/src/worker.rs`         |
+| Normalized worker outcomes | `crates/openengine-cluster-protocol/src/worker/outcome.rs` |
+| Worker registry boundary   | `crates/openengine-cluster-server/src/worker_registry.rs`  |
+| Mock worker profiles       | `crates/openengine-cluster-testkit/src/worker_profiles.rs` |
+
+Worker descriptors and registry compatibility checks are contract/pre-admission ports only.
+ACP/A2A modules in the testkit are mock conformance profiles, never production transports.
+Descriptors must declare all four closed runtime errors (`timeout`, `crash`, `malformed`, `refusal`).
+The reserved legacy descriptor is valid only with its canonical request/result payload types, while
+mock verifier completions must validate output, signals, diagnostics, and artifacts before emission.
+Worker JSON Schema must mirror descriptor cross-field/uniqueness validation and the closed
+error-code/reason matrix; registry compatibility must reject verifier contracts on step nodes.
+
+The legacy cluster worker is the bounded Node implementation of `legacy.zeroshot.ship@1`.
+Its public facade is exactly `start`, `status`, `events`, `stop`, and `result`; do not add
+guidance, permission callbacks, writable attach, raw output, credential fields, or caller launch
+flags. Registry resolution must produce a frozen worktree/docker plan before engine allocation.
+Lifecycle and terminal truth comes from cluster records plus durable ledger topics; PID state is
+diagnostic only. Explicit stop is bounded by the registry shutdown deadline and never claims that
+provider or tool side effects were rolled back.
+Completion events require a canonical result or explicit bounded summary, and failure events require
+a valid closed code/reason pair; missing or corrupt terminal data fails as `malformed`. Engine status
+observation is synchronous and fails closed when durable truth cannot be read.
+Profile resolution, artifact staging, engine start, and receipt collection remain cancellable under
+the registry execution bound; stop may win before engine allocation. A caller shutdown deadline
+bounds stop acknowledgement, not cleanup ownership: the engine adapter must still stop a cluster
+that allocates late while start remains pending, then release its orchestrator exactly once so
+process EOF cannot retain engine handles. The executable may wait for that cleanup only until its
+own shutdown deadline; at the deadline it invokes the internal release port and exits.
+Artifact input has no echo-only default resolver. The current engine allocates isolation first,
+then runs the injected resolver before agents start; the resolver must materialize read-only content
+inside that workspace. Cancelled profile, staging, and receipt operations retain late cleanup
+ownership through their injected `release`/`cleanup` hooks. Late operation and cleanup failures must
+reach the cleanup-failure reporter (default: process warning); never detach them with an empty catch.
 
 ## CLI Quick Reference
 
@@ -194,11 +346,11 @@ Docker: fresh git clone in container, credentials mounted, auto-cleanup.
 
 Configurable credential mounts for `--docker` mode. See `lib/docker-config.js`.
 
-| Setting | Type | Default | Description |
+| Setting                | Type          | Default  | Description                                           |
 | ---------------------- | ------------- | -------- | ----------------------------------------------------- | ---------------------------------------- |
-| `dockerMounts` | `Array<string | object>` | `['gh','git','ssh']` | Presets or `{host, container, readonly}` |
-| `dockerEnvPassthrough` | `string[]` | `[]` | Extra env vars (supports `VAR`, `VAR_*`, `VAR=value`) |
-| `dockerContainerHome` | `string` | `/root` | Container home for `$HOME` expansion |
+| `dockerMounts`         | `Array<string | object>` | `['gh','git','ssh']`                                  | Presets or `{host, container, readonly}` |
+| `dockerEnvPassthrough` | `string[]`    | `[]`     | Extra env vars (supports `VAR`, `VAR_*`, `VAR=value`) |
+| `dockerContainerHome`  | `string`      | `/root`  | Container home for `$HOME` expansion                  |
 
 Mount presets: infrastructure presets plus provider ids from `src/agent-cli-provider/provider-registry.ts`.
 
@@ -394,6 +546,7 @@ Run validation for:
 - When user explicitly requests
 
 Trust pre-commit hooks for trivial changes.
+`npm run test:unit` uses a temporary home and settings path; operator settings must not affect it.
 
 ```bash
 npm run lint
@@ -401,6 +554,8 @@ npm run test
 ```
 
 Mocha config: `.mocharc.cjs` applies defaults; passing explicit `*.test.js` files on the CLI skips the default `tests/**/*.test.js` spec.
+The Mocha bootstrap isolates unit tests from live `ZEROSHOT_*` run options and user settings;
+tests must not depend on ambient cluster state or `~/.zeroshot/settings.json`.
 
 Workers are now explicitly ordered to treat every `VALIDATION_RESULT` line as non-negotiable law before typing again. Failing to read and address each validator complaint before claiming completion will be rejected automatically.
 

@@ -5,7 +5,8 @@
   "main": "src/orchestrator.js",
   "bin": {
     "zeroshot": "./cli/index.js",
-    "zeroshot-agent-provider": "./lib/agent-cli-provider/executable.js"
+    "zeroshot-agent-provider": "./lib/agent-cli-provider/executable.js",
+    "zeroshot-cluster-worker": "./bin/zeroshot-cluster-worker.js"
   },
   "directories": {
     "example": "examples",
@@ -63,6 +64,8 @@
     "validate:templates": "node scripts/validate-templates.js",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
+    "protocol:check": "cargo run -p openengine-cluster-testkit --bin generate-cluster-protocol -- --check",
+    "rust:check": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace",
     "deadcode": "ts-prune --skip node_modules",
     "deadcode:files": "unimported",
     "deadcode:deps": "depcheck",
@@ -123,12 +126,15 @@
   "files": [
     "src/",
     "lib/",
+    "bin/",
     "cli/",
     "task-lib/",
     "cluster-templates/",
     "cluster-hooks/",
     "docker/",
     "scripts/",
+    "protocol/openengine-cluster/v1/worker.schema.json",
+    "docs/openengine-cluster-protocol/v1/legacy-worker.md",
     "README.md",
     "LICENSE",
     "CHANGELOG.md"

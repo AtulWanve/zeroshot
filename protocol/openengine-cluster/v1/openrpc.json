@@ -1,0 +1,319 @@
+{
+  "components": {
+    "schemas": {
+      "ArtifactRef": {
+        "$ref": "graph.schema.json#/$defs/ArtifactRef"
+      },
+      "CompiledGraphIr": {
+        "$ref": "compiled-ir.schema.json"
+      },
+      "GraphDiagnostic": {
+        "$ref": "graph.schema.json#/$defs/GraphDiagnostic"
+      },
+      "GraphSpec": {
+        "$ref": "graph.schema.json"
+      },
+      "LegacyShipRequest": {
+        "$ref": "worker.schema.json#/$defs/LegacyShipRequest"
+      },
+      "LegacyShipResult": {
+        "$ref": "worker.schema.json#/$defs/LegacyShipResult"
+      },
+      "StructuralBounds": {
+        "$ref": "graph.schema.json#/$defs/StructuralBounds"
+      },
+      "WorkerDescriptor": {
+        "$ref": "worker.schema.json"
+      },
+      "WorkerOutcome": {
+        "$ref": "worker.schema.json#/$defs/WorkerOutcome"
+      }
+    }
+  },
+  "info": {
+    "title": "Open Engine Cluster Protocol",
+    "version": "1.0.0"
+  },
+  "methods": [
+    {
+      "name": "initialize",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "protocolVersion",
+          "required": true,
+          "schema": {
+            "const": "openengine.cluster/v1",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "initializeResult",
+        "schema": {
+          "$ref": "schema.json#/$defs/InitializeResult"
+        }
+      }
+    },
+    {
+      "name": "plan",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "graph",
+          "required": true,
+          "schema": {
+            "$ref": "schema.json#/$defs/GraphSpec"
+          }
+        }
+      ],
+      "result": {
+        "name": "planResult",
+        "schema": {
+          "$ref": "schema.json#/$defs/PlanResult"
+        }
+      }
+    },
+    {
+      "name": "apply",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "graph",
+          "required": true,
+          "schema": {
+            "$ref": "schema.json#/$defs/GraphSpec"
+          }
+        },
+        {
+          "name": "input",
+          "required": false,
+          "schema": true
+        },
+        {
+          "name": "dryRun",
+          "required": false,
+          "schema": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        {
+          "name": "ifGeneration",
+          "required": false,
+          "schema": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        {
+          "name": "idempotencyKey",
+          "required": false,
+          "schema": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "applyResult",
+        "schema": {
+          "$ref": "schema.json#/$defs/ApplyResult"
+        }
+      }
+    },
+    {
+      "name": "update",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "labels",
+          "required": false,
+          "schema": {
+            "$ref": "schema.json#/$defs/Labels"
+          }
+        },
+        {
+          "name": "logLevel",
+          "required": false,
+          "schema": {
+            "$ref": "schema.json#/$defs/LogLevel"
+          }
+        },
+        {
+          "name": "suspended",
+          "required": false,
+          "schema": {
+            "type": "boolean"
+          }
+        },
+        {
+          "name": "ifGeneration",
+          "required": true,
+          "schema": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        {
+          "name": "idempotencyKey",
+          "required": true,
+          "schema": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "updateResult",
+        "schema": {
+          "$ref": "schema.json#/$defs/UpdateResult"
+        }
+      },
+      "x-params-schema": {
+        "$defs": {
+          "Labels": {
+            "additionalProperties": {
+              "maxLength": 256,
+              "minLength": 1,
+              "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$",
+              "type": "string"
+            },
+            "maxProperties": 64,
+            "propertyNames": {
+              "maxLength": 256,
+              "minLength": 1,
+              "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$",
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "LogLevel": {
+            "enum": [
+              "trace",
+              "debug",
+              "info",
+              "warn",
+              "error"
+            ],
+            "type": "string"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "labels"
+            ]
+          },
+          {
+            "required": [
+              "logLevel"
+            ]
+          },
+          {
+            "required": [
+              "suspended"
+            ]
+          }
+        ],
+        "properties": {
+          "idempotencyKey": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$",
+            "type": "string"
+          },
+          "ifGeneration": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "labels": {
+            "$ref": "#/$defs/Labels"
+          },
+          "logLevel": {
+            "$ref": "#/$defs/LogLevel"
+          },
+          "suspended": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ifGeneration",
+          "idempotencyKey"
+        ],
+        "title": "UpdateParams",
+        "type": "object"
+      }
+    },
+    {
+      "name": "stop",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "mode",
+          "required": true,
+          "schema": {
+            "$ref": "schema.json#/$defs/StopMode"
+          }
+        },
+        {
+          "name": "ifGeneration",
+          "required": true,
+          "schema": {
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        {
+          "name": "idempotencyKey",
+          "required": true,
+          "schema": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "stopResult",
+        "schema": {
+          "$ref": "schema.json#/$defs/StopResult"
+        }
+      }
+    },
+    {
+      "name": "get",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "atCursor",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "getResult",
+        "schema": {
+          "$ref": "schema.json#/$defs/GetResult"
+        }
+      }
+    }
+  ],
+  "openrpc": "1.3.2"
+}

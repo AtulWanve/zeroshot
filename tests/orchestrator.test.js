@@ -175,6 +175,144 @@ function _createValidatorConfig() {
   };
 }
 
+function createPartialValidationResumeConfig(worktreeDir) {
+  const validationSchema = {
+    type: 'object',
+    properties: {
+      approved: { type: 'boolean' },
+      summary: { type: 'string' },
+    },
+    required: ['approved'],
+  };
+
+  const validationHook = {
+    onComplete: {
+      action: 'publish_message',
+      config: {
+        topic: 'VALIDATION_RESULT',
+        content: {
+          text: '{{result.summary}}',
+          data: {
+            approved: '{{result.approved}}',
+          },
+        },
+      },
+    },
+  };
+
+  return {
+    agents: [
+      {
+        id: 'worker',
+        role: 'implementation',
+        modelLevel: 'level2',
+        outputFormat: 'text',
+        cwd: worktreeDir,
+        triggers: [
+          {
+            topic: 'VALIDATION_RESULT',
+            logic: {
+              engine: 'javascript',
+              script:
+                "const validators = cluster.getAgentsByRole('validator');\n" +
+                "const lastPush = ledger.findLast({ topic: 'IMPLEMENTATION_READY' });\n" +
+                'if (!lastPush) return false;\n' +
+                "const responses = ledger.query({ topic: 'VALIDATION_RESULT', since: lastPush.timestamp });\n" +
+                'const validatorIds = new Set(validators.map((v) => v.id));\n' +
+                'const latestByValidator = new Map();\n' +
+                'for (const response of responses) {\n' +
+                '  if (validatorIds.has(response.sender)) latestByValidator.set(response.sender, response);\n' +
+                '}\n' +
+                'if (latestByValidator.size < validators.length) return false;\n' +
+                'return Array.from(latestByValidator.values()).some((response) =>\n' +
+                "  response.content?.data?.approved === false || response.content?.data?.approved === 'false'\n" +
+                ');',
+            },
+            action: 'execute_task',
+          },
+        ],
+        prompt: 'Repair rejected validation findings.',
+      },
+      ...['validator-requirements', 'validator-code'].map((id) => ({
+        id,
+        role: 'validator',
+        modelLevel: 'level2',
+        outputFormat: 'json',
+        jsonSchema: validationSchema,
+        cwd: worktreeDir,
+        triggers: [{ topic: 'IMPLEMENTATION_READY', action: 'execute_task' }],
+        hooks: validationHook,
+        prompt: `Validate as ${id}.`,
+      })),
+    ],
+  };
+}
+
+async function waitForAgentCalls(runner, expectedCalls, timeoutMs = 3000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const complete = Object.entries(expectedCalls).every(
+      ([agentId, count]) => runner.getCalls(agentId).length === count
+    );
+    if (complete) {
+      return;
+    }
+    await sleep(20);
+  }
+
+  const actual = Object.fromEntries(
+    Object.keys(expectedCalls).map((agentId) => [agentId, runner.getCalls(agentId).length])
+  );
+  throw new Error(
+    `Agent calls did not reach ${JSON.stringify(expectedCalls)}; actual ${JSON.stringify(actual)}`
+  );
+}
+
+function publishInterruptedTaskHistory(
+  cluster,
+  clusterId,
+  agentId,
+  { iteration, taskId, triggeredBy }
+) {
+  cluster.messageBus.publish({
+    cluster_id: clusterId,
+    topic: 'AGENT_LIFECYCLE',
+    sender: agentId,
+    content: {
+      text: `${agentId}: TASK_STARTED`,
+      data: {
+        event: 'TASK_STARTED',
+        agent: agentId,
+        state: 'executing_task',
+        iteration,
+        triggeredBy,
+      },
+    },
+  });
+  cluster.messageBus.publish({
+    cluster_id: clusterId,
+    topic: 'AGENT_LIFECYCLE',
+    sender: agentId,
+    content: {
+      text: `${agentId}: TASK_ID_ASSIGNED`,
+      data: {
+        event: 'TASK_ID_ASSIGNED',
+        agent: agentId,
+        state: 'executing_task',
+        taskId,
+      },
+    },
+  });
+}
+
+function deleteLedgerTopics(cluster, clusterId, topics) {
+  const placeholders = topics.map(() => '?').join(', ');
+  cluster.ledger.db
+    .prepare(`DELETE FROM messages WHERE cluster_id = ? AND topic IN (${placeholders})`)
+    .run(clusterId, ...topics);
+  cluster.ledger.cache.clear();
+}
+
 let lifecycleOrchestrator;
 let lifecycleMockRunner;
 let lifecycleStorageDir;
@@ -292,7 +430,7 @@ function defineLifecycleStartTests() {
       assert.strictEqual(callCount, 2, 'Expected SIGTERM failure to trigger one retry');
     });
 
-    it('should restart implementation agent after retries exhausted', async function () {
+    it('should stop after implementation agent retries are exhausted', async function () {
       const config = {
         agents: [
           {
@@ -304,12 +442,7 @@ function defineLifecycleStartTests() {
             hooks: {
               onComplete: {
                 action: 'publish_message',
-                config: {
-                  topic: 'CLUSTER_COMPLETE',
-                  content: {
-                    data: { reason: 'restart-after-exhausted-retries-test' },
-                  },
-                },
+                config: { topic: 'CLUSTER_COMPLETE' },
               },
             },
           },
@@ -319,10 +452,7 @@ function defineLifecycleStartTests() {
       let callCount = 0;
       lifecycleMockRunner.when('worker').calls(() => {
         callCount += 1;
-        if (callCount <= 3) {
-          return { success: false, output: '', error: 'Request timed out' };
-        }
-        return { success: true, output: 'ok' };
+        return { success: false, output: '', error: 'Request timed out' };
       });
 
       const result = await lifecycleOrchestrator.start(config, { text: 'Fix bug' });
@@ -330,9 +460,9 @@ function defineLifecycleStartTests() {
 
       const cluster = lifecycleOrchestrator.getCluster(result.id);
       const ledger = new LedgerAssertions(cluster.ledger, result.id);
-      ledger.assertCount('AGENT_RESTART_ATTEMPT', 1);
+      ledger.assertCount('AGENT_ERROR', 1);
 
-      assert.ok(callCount >= 4, `Expected worker to be invoked at least 4 times, got ${callCount}`);
+      assert.strictEqual(callCount, 3, 'Expected the worker to stop after three failed attempts');
     });
 
     it('should inject worktree cwd when worktree enabled', function () {
@@ -475,15 +605,15 @@ function defineLifecycleStartTests() {
         'Should reject missing input'
       );
 
-      // Regression: startup failures must be persisted for supervisor visibility (no "invisible" clusters).
+      // Input rejection precedes cluster, ledger, and isolation allocation.
       const clustersFile = path.join(lifecycleStorageDir, 'clusters.json');
-      assert.ok(fs.existsSync(clustersFile), 'clusters.json should exist after failed start');
-      const persisted = JSON.parse(fs.readFileSync(clustersFile, 'utf8'));
-      const ids = Object.keys(persisted);
-      assert.equal(ids.length, 1, 'Expected exactly one persisted cluster entry');
-      const c = persisted[ids[0]];
-      assert.equal(c.state, 'failed', 'Failed start should persist state=failed');
-      assert.equal(c.pid, null, 'Failed start should persist pid=null');
+      assert.strictEqual(lifecycleOrchestrator.clusters.size, 0);
+      assert.ok(!fs.existsSync(clustersFile), 'Rejected input must not create clusters.json');
+      assert.deepStrictEqual(
+        fs.readdirSync(lifecycleStorageDir).filter((entry) => entry.endsWith('.db')),
+        [],
+        'Rejected input must not allocate a ledger database'
+      );
     });
 
     it('should auto-generate unique cluster IDs', async function () {
@@ -562,11 +692,23 @@ function defineLifecycleStopTests() {
       const result = await lifecycleOrchestrator.start(config, { text: 'Task' });
       const clusterId = result.id;
 
-      // Simulate --pr/--ship mode by setting autoPr on the cluster
+      // Simulate --pr/--ship mode with the worktree resource that stop() owns.
       const cluster = lifecycleOrchestrator.getCluster(clusterId);
       cluster.autoPr = true;
+      let cleanupCalls = 0;
+      cluster.worktree = {
+        branch: 'test-branch',
+        manager: {
+          cleanupWorktreeIsolation(cleanupClusterId, options) {
+            assert.strictEqual(cleanupClusterId, clusterId);
+            assert.deepStrictEqual(options, { preserveBranch: true });
+            cleanupCalls += 1;
+          },
+        },
+      };
 
       await lifecycleOrchestrator.stop(clusterId, { completedSuccessfully: true });
+      assert.strictEqual(cleanupCalls, 1, 'Worktree should be cleaned exactly once');
 
       // Verify: Cluster removed from memory (same as kill behavior)
       const afterStop = lifecycleOrchestrator.getCluster(clusterId);
@@ -700,6 +842,619 @@ function defineLifecycleKillTests() {
 
 function defineLifecycleResumeTests() {
   describe('resume()', function () {
+    it('resumes an interrupted validator before routing the aggregate rejection to the worker', async function () {
+      const worktreeDir = fs.mkdtempSync(path.join(lifecycleStorageDir, 'resume-worktree-'));
+      const config = createPartialValidationResumeConfig(worktreeDir);
+      const result = await lifecycleOrchestrator.start(
+        config,
+        { text: 'Repair validation findings' },
+        { clusterId: 'partial-validation-resume' }
+      );
+      const clusterId = result.id;
+
+      await lifecycleOrchestrator.stop(clusterId);
+      const cluster = lifecycleOrchestrator.getCluster(clusterId);
+
+      cluster.messageBus.publish({
+        cluster_id: clusterId,
+        topic: 'IMPLEMENTATION_READY',
+        sender: 'worker',
+        content: { text: 'Implementation ready for validation' },
+      });
+      publishInterruptedTaskHistory(cluster, clusterId, 'validator-requirements', {
+        iteration: 3,
+        taskId: 'interrupted-validator-task',
+        triggeredBy: 'IMPLEMENTATION_READY',
+      });
+      cluster.messageBus.publish({
+        cluster_id: clusterId,
+        topic: 'AGENT_LIFECYCLE',
+        sender: 'validator-code',
+        content: {
+          text: 'validator-code: TASK_STARTED',
+          data: {
+            event: 'TASK_STARTED',
+            agent: 'validator-code',
+            role: 'validator',
+            state: 'executing_task',
+            iteration: 3,
+          },
+        },
+      });
+      cluster.messageBus.publish({
+        cluster_id: clusterId,
+        topic: 'AGENT_LIFECYCLE',
+        sender: 'validator-code',
+        content: {
+          text: 'validator-code: TASK_COMPLETED',
+          data: {
+            event: 'TASK_COMPLETED',
+            agent: 'validator-code',
+            role: 'validator',
+            state: 'idle',
+            iteration: 3,
+            taskId: 'completed-validator-task',
+          },
+        },
+      });
+      cluster.messageBus.publish({
+        cluster_id: clusterId,
+        topic: 'VALIDATION_RESULT',
+        sender: 'validator-code',
+        content: {
+          text: 'Rejected with actionable findings',
+          data: { approved: false, errors: ['repair this'] },
+        },
+      });
+
+      const interruptedValidator = cluster.agents.find(
+        (agent) => agent.id === 'validator-requirements'
+      );
+      interruptedValidator.state = 'executing_task';
+      interruptedValidator.iteration = 3;
+      interruptedValidator.currentTaskId = 'interrupted-validator-task';
+      interruptedValidator.processPid = 4242;
+
+      const completedValidator = cluster.agents.find((agent) => agent.id === 'validator-code');
+      completedValidator.state = 'idle';
+      completedValidator.iteration = 3;
+      completedValidator.currentTaskId = 'completed-validator-task';
+      completedValidator.processPid = null;
+
+      await lifecycleOrchestrator._saveClusters();
+      lifecycleOrchestrator.close();
+
+      const resumedRunner = new MockTaskRunner();
+      resumedRunner
+        .when('validator-requirements')
+        .returns({ approved: true, summary: 'Requirements approved' });
+      resumedRunner.when('worker').returns('Repaired validation findings');
+
+      lifecycleOrchestrator = await Orchestrator.create({
+        taskRunner: resumedRunner,
+        storageDir: lifecycleStorageDir,
+        quiet: true,
+      });
+
+      const validationCountBeforeResume = lifecycleOrchestrator
+        .getCluster(clusterId)
+        .messageBus.count({ cluster_id: clusterId, topic: 'VALIDATION_RESULT' });
+
+      const resumed = await lifecycleOrchestrator.resume(clusterId);
+      await waitForAgentCalls(resumedRunner, {
+        'validator-requirements': 1,
+        worker: 1,
+      });
+
+      const resumedCluster = lifecycleOrchestrator.getCluster(clusterId);
+      const resumedRequirements = resumedCluster.agents.find(
+        (agent) => agent.id === 'validator-requirements'
+      );
+
+      assert.deepStrictEqual(resumed.resumedAgents, ['validator-requirements']);
+      assert.strictEqual(resumed.state, 'running');
+      assert.notStrictEqual(
+        resumedRequirements.currentTaskId,
+        'interrupted-validator-task',
+        'the stale interrupted task id must not survive recovery'
+      );
+      assert.strictEqual(resumedRequirements.processPid, null);
+      assert.strictEqual(
+        resumedRequirements.config.cwd,
+        worktreeDir,
+        'resume must reuse the persisted worktree cwd'
+      );
+      resumedRunner.assertCalled('validator-code', 0);
+      assert.strictEqual(
+        resumedCluster.messageBus.count({
+          cluster_id: clusterId,
+          topic: 'VALIDATION_RESULT',
+        }),
+        validationCountBeforeResume + 1,
+        'only the interrupted validator may append a new validation result'
+      );
+    });
+
+    it('resumes a missing validator in a partial validation cycle without replaying completed results', async function () {
+      const worktreeDir = fs.mkdtempSync(path.join(lifecycleStorageDir, 'resume-worktree-'));
+      const config = createPartialValidationResumeConfig(worktreeDir);
+      const result = await lifecycleOrchestrator.start(
+        config,
+        { text: 'Repair validation findings' },
+        { clusterId: 'missing-validator-resume' }
+      );
+      const clusterId = result.id;
+
+      await lifecycleOrchestrator.stop(clusterId);
+      const cluster = lifecycleOrchestrator.getCluster(clusterId);
+      cluster.messageBus.publish({
+        cluster_id: clusterId,
+        topic: 'IMPLEMENTATION_READY',
+        sender: 'worker',
+        content: { text: 'Implementation ready for validation' },
+      });
+      cluster.messageBus.publish({
+        cluster_id: clusterId,
+        topic: 'VALIDATION_RESULT',
+        sender: 'validator-code',
+        content: {
+          text: 'Rejected with actionable findings',
+          data: { approved: false, errors: ['repair this'] },
+        },
+      });
+      await lifecycleOrchestrator._saveClusters();
+      lifecycleOrchestrator.close();
+
+      const resumedRunner = new MockTaskRunner();
+      resumedRunner
+        .when('validator-requirements')
+        .returns({ approved: true, summary: 'Requirements approved' });
+      resumedRunner.when('worker').returns('Repaired validation findings');
+      lifecycleOrchestrator = await Orchestrator.create({
+        taskRunner: resumedRunner,
+        storageDir: lifecycleStorageDir,
+        quiet: true,
+      });
+
+      const restoredCluster = lifecycleOrchestrator.getCluster(clusterId);
+      const validationCountBeforeResume = restoredCluster.messageBus.count({
+        cluster_id: clusterId,
+        topic: 'VALIDATION_RESULT',
+      });
+
+      const resumed = await lifecycleOrchestrator.resume(clusterId);
+      await waitForAgentCalls(resumedRunner, {
+        'validator-requirements': 1,
+        worker: 1,
+      });
+
+      assert.deepStrictEqual(resumed.resumedAgents, ['validator-requirements']);
+      resumedRunner.assertCalled('validator-code', 0);
+      assert.strictEqual(
+        restoredCluster.messageBus.count({
+          cluster_id: clusterId,
+          topic: 'VALIDATION_RESULT',
+        }),
+        validationCountBeforeResume + 1,
+        'the completed validator result must remain a singleton'
+      );
+    });
+
+    it('recovers an interrupted worker when durable workflow history is older than recent output', async function () {
+      const worktreeDir = fs.mkdtempSync(path.join(lifecycleStorageDir, 'resume-worktree-'));
+      const config = createPartialValidationResumeConfig(worktreeDir);
+      const workerConfig = config.agents.find((agent) => agent.id === 'worker');
+      workerConfig.triggers = [{ topic: 'WORKER_PROGRESS', action: 'execute_task' }];
+
+      const result = await lifecycleOrchestrator.start(
+        config,
+        { text: 'Continue the original issue exactly once' },
+        { clusterId: 'old-workflow-history-resume' }
+      );
+      const clusterId = result.id;
+
+      await lifecycleOrchestrator.stop(clusterId);
+      const cluster = lifecycleOrchestrator.getCluster(clusterId);
+      cluster.messageBus.publish({
+        cluster_id: clusterId,
+        topic: 'WORKER_PROGRESS',
+        sender: 'worker',
+        content: { text: 'Previous iteration needs another pass' },
+      });
+      publishInterruptedTaskHistory(cluster, clusterId, 'worker', {
+        iteration: 3,
+        taskId: 'interrupted-worker-task',
+        triggeredBy: 'WORKER_PROGRESS',
+      });
+      for (let index = 0; index < 75; index += 1) {
+        cluster.messageBus.publish({
+          cluster_id: clusterId,
+          topic: 'AGENT_OUTPUT',
+          sender: 'worker',
+          content: { text: `historical output ${index}` },
+        });
+      }
+      cluster.messageBus.publish({
+        cluster_id: clusterId,
+        topic: 'AGENT_LIFECYCLE',
+        sender: 'worker',
+        content: {
+          text: 'worker: STARTED',
+          data: {
+            event: 'STARTED',
+            agent: 'worker',
+            role: 'implementation',
+            state: 'idle',
+          },
+        },
+      });
+
+      const interruptedWorker = cluster.agents.find((agent) => agent.id === 'worker');
+      interruptedWorker.state = 'executing_task';
+      interruptedWorker.iteration = 3;
+      interruptedWorker.currentTaskId = 'interrupted-worker-task';
+      interruptedWorker.processPid = 88623;
+
+      await lifecycleOrchestrator._saveClusters();
+      lifecycleOrchestrator.close();
+
+      const resumedRunner = new MockTaskRunner();
+      resumedRunner.when('worker').returns('Continued original issue');
+      lifecycleOrchestrator = await Orchestrator.create({
+        taskRunner: resumedRunner,
+        storageDir: lifecycleStorageDir,
+        quiet: true,
+      });
+
+      const restoredCluster = lifecycleOrchestrator.getCluster(clusterId);
+      const issueCountBeforeResume = restoredCluster.messageBus.count({
+        cluster_id: clusterId,
+        topic: 'ISSUE_OPENED',
+      });
+
+      const resumed = await lifecycleOrchestrator.resume(clusterId);
+      await waitForAgentCalls(resumedRunner, { worker: 1 });
+
+      const resumedWorker = restoredCluster.agents.find((agent) => agent.id === 'worker');
+      assert.deepStrictEqual(resumed.resumedAgents, ['worker']);
+      assert.notStrictEqual(resumedWorker.currentTaskId, 'interrupted-worker-task');
+      assert.strictEqual(resumedWorker.config.cwd, worktreeDir);
+      assert.strictEqual(
+        restoredCluster.messageBus.count({ cluster_id: clusterId, topic: 'ISSUE_OPENED' }),
+        issueCountBeforeResume,
+        'recovery must not duplicate durable issue execution'
+      );
+      assert.match(
+        resumedRunner.getCalls('worker')[0].context,
+        /Continue the original issue exactly once/,
+        'the resumed invocation must receive durable original task context even when it is old'
+      );
+      resumedRunner.assertCalled('validator-code', 0);
+      resumedRunner.assertCalled('validator-requirements', 0);
+    });
+
+    it('fails atomically when interrupted task-id history is missing or mismatched', async function () {
+      for (const scenario of [
+        { clusterId: 'missing-task-id-history', assignedTaskId: null },
+        { clusterId: 'mismatched-task-id-history', assignedTaskId: 'different-ledger-task' },
+      ]) {
+        const worktreeDir = fs.mkdtempSync(path.join(lifecycleStorageDir, 'resume-worktree-'));
+        const config = createPartialValidationResumeConfig(worktreeDir);
+        config.agents.find((agent) => agent.id === 'worker').triggers = [
+          { topic: 'WORKER_PROGRESS', action: 'execute_task' },
+        ];
+        const result = await lifecycleOrchestrator.start(
+          config,
+          { text: 'Preserve task identity during resume' },
+          { clusterId: scenario.clusterId }
+        );
+        const clusterId = result.id;
+
+        await lifecycleOrchestrator.stop(clusterId);
+        const cluster = lifecycleOrchestrator.getCluster(clusterId);
+        cluster.messageBus.publish({
+          cluster_id: clusterId,
+          topic: 'WORKER_PROGRESS',
+          sender: 'worker',
+          content: { text: 'Interrupted work' },
+        });
+        cluster.messageBus.publish({
+          cluster_id: clusterId,
+          topic: 'AGENT_LIFECYCLE',
+          sender: 'worker',
+          content: {
+            text: 'worker: TASK_STARTED',
+            data: {
+              event: 'TASK_STARTED',
+              agent: 'worker',
+              state: 'executing_task',
+              iteration: 3,
+              triggeredBy: 'WORKER_PROGRESS',
+            },
+          },
+        });
+        if (scenario.assignedTaskId) {
+          cluster.messageBus.publish({
+            cluster_id: clusterId,
+            topic: 'AGENT_LIFECYCLE',
+            sender: 'worker',
+            content: {
+              text: 'worker: TASK_ID_ASSIGNED',
+              data: {
+                event: 'TASK_ID_ASSIGNED',
+                agent: 'worker',
+                state: 'executing_task',
+                taskId: scenario.assignedTaskId,
+              },
+            },
+          });
+        }
+
+        const interruptedWorker = cluster.agents.find((agent) => agent.id === 'worker');
+        interruptedWorker.state = 'executing_task';
+        interruptedWorker.iteration = 3;
+        interruptedWorker.currentTaskId = 'persisted-task-id';
+        interruptedWorker.processPid = 88623;
+
+        deleteLedgerTopics(cluster, clusterId, ['STATE_SNAPSHOT']);
+        await lifecycleOrchestrator._saveClusters();
+        const messageCountBeforeReload = cluster.messageBus.count({ cluster_id: clusterId });
+        lifecycleOrchestrator.close();
+
+        const resumedRunner = new MockTaskRunner();
+        lifecycleOrchestrator = await Orchestrator.create({
+          taskRunner: resumedRunner,
+          storageDir: lifecycleStorageDir,
+          quiet: true,
+        });
+
+        const restoredCluster = lifecycleOrchestrator.getCluster(clusterId);
+        await assert.rejects(
+          () => lifecycleOrchestrator.resume(clusterId),
+          (error) => {
+            assert.strictEqual(error.code, 'RESUME_RECONSTRUCTION_FAILED');
+            assert.match(error.message, /interrupted-task state is ambiguous/i);
+            return true;
+          }
+        );
+
+        assert.strictEqual(
+          restoredCluster.messageBus.count({ cluster_id: clusterId }),
+          messageCountBeforeReload,
+          'loading and rejecting resume must not append a snapshot or other ledger event'
+        );
+        resumedRunner.assertCalled('worker', 0);
+      }
+    });
+
+    it('fails atomically when interrupted work has no durable workflow context', async function () {
+      const worktreeDir = fs.mkdtempSync(path.join(lifecycleStorageDir, 'resume-worktree-'));
+      const config = createPartialValidationResumeConfig(worktreeDir);
+      config.agents.find((agent) => agent.id === 'worker').triggers = [
+        { topic: 'WORKER_PROGRESS', action: 'execute_task' },
+      ];
+      const result = await lifecycleOrchestrator.start(
+        config,
+        { text: 'This task context must not be guessed' },
+        { clusterId: 'missing-workflow-context' }
+      );
+      const clusterId = result.id;
+
+      await lifecycleOrchestrator.stop(clusterId);
+      const cluster = lifecycleOrchestrator.getCluster(clusterId);
+      publishInterruptedTaskHistory(cluster, clusterId, 'worker', {
+        iteration: 3,
+        taskId: 'interrupted-worker-task',
+        triggeredBy: 'WORKER_PROGRESS',
+      });
+      const interruptedWorker = cluster.agents.find((agent) => agent.id === 'worker');
+      interruptedWorker.state = 'executing_task';
+      interruptedWorker.iteration = 3;
+      interruptedWorker.currentTaskId = 'interrupted-worker-task';
+      interruptedWorker.processPid = 88623;
+
+      deleteLedgerTopics(cluster, clusterId, [
+        'ISSUE_OPENED',
+        'PLAN_READY',
+        'IMPLEMENTATION_READY',
+        'VALIDATION_RESULT',
+        'PUSH_BLOCKED',
+        'CONDUCTOR_ESCALATE',
+        'STATE_SNAPSHOT',
+      ]);
+      await lifecycleOrchestrator._saveClusters();
+      const messageCountBeforeReload = cluster.messageBus.count({ cluster_id: clusterId });
+      lifecycleOrchestrator.close();
+
+      const resumedRunner = new MockTaskRunner();
+      lifecycleOrchestrator = await Orchestrator.create({
+        taskRunner: resumedRunner,
+        storageDir: lifecycleStorageDir,
+        quiet: true,
+      });
+      const restoredCluster = lifecycleOrchestrator.getCluster(clusterId);
+
+      await assert.rejects(
+        () => lifecycleOrchestrator.resume(clusterId),
+        (error) => {
+          assert.strictEqual(error.code, 'RESUME_RECONSTRUCTION_FAILED');
+          assert.match(error.message, /no durable workflow context/i);
+          assert.match(error.message, /zeroshot export missing-workflow-context/i);
+          assert.match(error.message, /do not launch a duplicate run/i);
+          assert.doesNotMatch(error.message, /zeroshot run/i);
+          return true;
+        }
+      );
+
+      assert.strictEqual(
+        restoredCluster.messageBus.count({ cluster_id: clusterId }),
+        messageCountBeforeReload
+      );
+      resumedRunner.assertCalled('worker', 0);
+    });
+
+    it('fails atomically when handlers are registered but no continuation is eligible', async function () {
+      const worktreeDir = fs.mkdtempSync(path.join(lifecycleStorageDir, 'resume-worktree-'));
+      const config = createPartialValidationResumeConfig(worktreeDir);
+      const result = await lifecycleOrchestrator.start(
+        config,
+        { text: 'Repair validation findings' },
+        { clusterId: 'ineligible-validation-resume' }
+      );
+      const clusterId = result.id;
+
+      await lifecycleOrchestrator.stop(clusterId);
+      const cluster = lifecycleOrchestrator.getCluster(clusterId);
+      cluster.messageBus.publish({
+        cluster_id: clusterId,
+        topic: 'IMPLEMENTATION_READY',
+        sender: 'worker',
+        content: { text: 'Implementation ready for validation' },
+      });
+      for (const sender of ['validator-code', 'validator-requirements']) {
+        cluster.messageBus.publish({
+          cluster_id: clusterId,
+          topic: 'VALIDATION_RESULT',
+          sender,
+          content: {
+            text: 'Approved',
+            data: { approved: true },
+          },
+        });
+      }
+      await lifecycleOrchestrator._saveClusters();
+      lifecycleOrchestrator.close();
+
+      lifecycleOrchestrator = await Orchestrator.create({
+        taskRunner: new MockTaskRunner(),
+        storageDir: lifecycleStorageDir,
+        quiet: true,
+      });
+
+      const restoredCluster = lifecycleOrchestrator.getCluster(clusterId);
+      const messageCountBeforeResume = restoredCluster.messageBus.count({
+        cluster_id: clusterId,
+      });
+
+      await assert.rejects(
+        () => lifecycleOrchestrator.resume(clusterId),
+        (error) => {
+          assert.strictEqual(error.code, 'RESUME_RECONSTRUCTION_FAILED');
+          assert.match(error.message, /registered by worker.*no handler is currently eligible/i);
+          assert.doesNotMatch(error.message, /no agents handle it/i);
+          return true;
+        }
+      );
+
+      assert.strictEqual(restoredCluster.state, 'stopped');
+      assert.strictEqual(restoredCluster.pid, null);
+      assert.strictEqual(restoredCluster.failureInfo.type, 'resume_reconstruction');
+      assert.strictEqual(restoredCluster.failureInfo.reason, 'registered_handlers_ineligible');
+      assert.strictEqual(
+        restoredCluster.messageBus.count({ cluster_id: clusterId }),
+        messageCountBeforeResume,
+        'failed reconstruction must not append ledger messages'
+      );
+      assert.ok(
+        restoredCluster.agents.every((agent) => agent.running === false),
+        'failed reconstruction must not start any agent'
+      );
+    });
+
+    it('distinguishes an unhandled trigger from an ineligible registered handler', async function () {
+      const worktreeDir = fs.mkdtempSync(path.join(lifecycleStorageDir, 'resume-worktree-'));
+      const config = createPartialValidationResumeConfig(worktreeDir);
+      config.agents.find((agent) => agent.id === 'worker').triggers = [];
+      const result = await lifecycleOrchestrator.start(
+        config,
+        { text: 'Repair validation findings' },
+        { clusterId: 'unhandled-validation-resume' }
+      );
+      const clusterId = result.id;
+
+      await lifecycleOrchestrator.stop(clusterId);
+      const cluster = lifecycleOrchestrator.getCluster(clusterId);
+      cluster.messageBus.publish({
+        cluster_id: clusterId,
+        topic: 'VALIDATION_RESULT',
+        sender: 'validator-code',
+        content: { text: 'Rejected', data: { approved: false } },
+      });
+      await lifecycleOrchestrator._saveClusters();
+      lifecycleOrchestrator.close();
+
+      lifecycleOrchestrator = await Orchestrator.create({
+        taskRunner: new MockTaskRunner(),
+        storageDir: lifecycleStorageDir,
+        quiet: true,
+      });
+
+      await assert.rejects(
+        () => lifecycleOrchestrator.resume(clusterId),
+        (error) => {
+          assert.strictEqual(error.code, 'RESUME_RECONSTRUCTION_FAILED');
+          assert.match(error.message, /no restored agent registers trigger VALIDATION_RESULT/i);
+          assert.doesNotMatch(error.message, /currently eligible/i);
+          return true;
+        }
+      );
+
+      const restoredCluster = lifecycleOrchestrator.getCluster(clusterId);
+      assert.strictEqual(restoredCluster.failureInfo.reason, 'unhandled_trigger');
+      assert.deepStrictEqual(restoredCluster.failureInfo.matchingAgentIds, undefined);
+    });
+
+    it('uses normal trigger eligibility after every validator result is durable', async function () {
+      const worktreeDir = fs.mkdtempSync(path.join(lifecycleStorageDir, 'resume-worktree-'));
+      const config = createPartialValidationResumeConfig(worktreeDir);
+      const result = await lifecycleOrchestrator.start(
+        config,
+        { text: 'Repair validation findings' },
+        { clusterId: 'complete-validation-resume' }
+      );
+      const clusterId = result.id;
+
+      await lifecycleOrchestrator.stop(clusterId);
+      const cluster = lifecycleOrchestrator.getCluster(clusterId);
+      cluster.messageBus.publish({
+        cluster_id: clusterId,
+        topic: 'IMPLEMENTATION_READY',
+        sender: 'worker',
+        content: { text: 'Implementation ready for validation' },
+      });
+      for (const [sender, approved] of [
+        ['validator-code', false],
+        ['validator-requirements', true],
+      ]) {
+        cluster.messageBus.publish({
+          cluster_id: clusterId,
+          topic: 'VALIDATION_RESULT',
+          sender,
+          content: {
+            text: approved ? 'Approved' : 'Rejected',
+            data: { approved },
+          },
+        });
+      }
+      await lifecycleOrchestrator._saveClusters();
+      lifecycleOrchestrator.close();
+
+      const resumedRunner = new MockTaskRunner();
+      resumedRunner.when('worker').returns('Repaired validation findings');
+      lifecycleOrchestrator = await Orchestrator.create({
+        taskRunner: resumedRunner,
+        storageDir: lifecycleStorageDir,
+        quiet: true,
+      });
+
+      const resumed = await lifecycleOrchestrator.resume(clusterId);
+      await waitForAgentCalls(resumedRunner, { worker: 1 });
+
+      assert.deepStrictEqual(resumed.resumedAgents, ['worker']);
+      resumedRunner.assertCalled('validator-code', 0);
+      resumedRunner.assertCalled('validator-requirements', 0);
+    });
+
     it('should restore ledger and cluster state', async function () {
       const config = createSimpleConfig();
       lifecycleMockRunner.when('worker').returns({ done: true });
@@ -814,6 +1569,41 @@ function defineLifecycleResumeTests() {
         },
         /still running/i,
         'Should reject resume of running cluster'
+      );
+    });
+
+    it('should recover a zombie cluster (state=running, dead pid) instead of rejecting resume', async function () {
+      const config = createSimpleConfig();
+      lifecycleMockRunner.when('worker').returns({ done: true });
+
+      const result = await lifecycleOrchestrator.start(config, { text: 'Task' });
+      await lifecycleOrchestrator.stop(result.id);
+
+      const cluster = lifecycleOrchestrator.getCluster(result.id);
+      cluster.failureInfo = {
+        agentId: 'worker',
+        iteration: 1,
+        error: 'boom',
+      };
+      // Simulate exactly the zombie condition getStatus()/listClusters() already
+      // detect: state says 'running' but the recorded PID belongs to a daemon
+      // that is no longer alive (e.g. it was killed by a caller timeout). Before
+      // the fix, resume() trusted `state` alone here and threw "still running",
+      // even though status would have reported this same cluster as a zombie.
+      cluster.state = 'running';
+      cluster.pid = 999999;
+
+      lifecycleMockRunner.when('worker').delays(500, { done: true, resumed: true });
+
+      const resumed = await lifecycleOrchestrator.resume(result.id);
+      const status = lifecycleOrchestrator.getStatus(result.id);
+
+      assert.strictEqual(resumed.resumeType, 'failure');
+      assert.strictEqual(cluster.pid, process.pid, 'Recovered cluster should record current PID');
+      assert.strictEqual(
+        status.state,
+        'running',
+        'Recovered cluster should be running, not zombie'
       );
     });
 
